@@ -1,0 +1,1091 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>二维码 / 条形码 防重复扫描</title>
+<style>
+  :root {
+    --bg: #f4f6fb;
+    --card: #ffffff;
+    --line: #e4e8f0;
+    --text: #1f2733;
+    --muted: #7a8494;
+    --accent: #2f6bff;
+    --green: #16a34a;
+    --red: #dc2626;
+    --amber: #d97706;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.6;
+  }
+  header {
+    background: linear-gradient(135deg, #2f6bff, #6a3df5);
+    color: #fff;
+    padding: 20px 28px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 12px;
+    box-shadow: 0 2px 12px rgba(0,0,0,.08);
+  }
+  header h1 { margin: 0; font-size: 20px; font-weight: 600; }
+  .stats { display: flex; gap: 22px; font-size: 14px; opacity: .95; }
+  .stats b { font-size: 20px; margin-left: 4px; }
+
+  main { max-width: 1200px; margin: 22px auto; padding: 0 16px; }
+
+  .banner {
+    max-width: 1200px; margin: 18px auto 0; padding: 0 16px;
+  }
+  .banner-inner {
+    border-radius: 12px; padding: 16px 20px; font-size: 15px;
+    border: 1px solid; display: flex; gap: 12px; align-items: flex-start;
+  }
+  .banner-inner.ok   { background: #ecfdf5; border-color: #a7f3d0; color: #065f46; }
+  .banner-inner.dup  { background: #fef2f2; border-color: #fecaca; color: #991b1b; animation: shake .4s; }
+  .banner-inner.err  { background: #fffbeb; border-color: #fde68a; color: #92400e; }
+  .banner .code { font-family: Consolas, monospace; word-break: break-all; font-weight: 600; }
+  .hidden { display: none !important; }
+  @keyframes shake {
+    0%,100% { transform: translateX(0); }
+    20%,60% { transform: translateX(-8px); }
+    40%,80% { transform: translateX(8px); }
+  }
+
+  .card {
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 14px; padding: 20px; margin-bottom: 20px;
+    box-shadow: 0 1px 3px rgba(0,0,0,.04);
+  }
+
+  .tabs { display: flex; gap: 8px; border-bottom: 1px solid var(--line); margin-bottom: 16px; flex-wrap: wrap; }
+  .tab {
+    border: none; background: transparent; padding: 10px 16px;
+    font-size: 15px; cursor: pointer; color: var(--muted);
+    border-bottom: 2px solid transparent; margin-bottom: -1px;
+  }
+  .tab.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
+
+  .panel { min-height: 120px; }
+
+  .video-wrap {
+    position: relative; background: #0f172a; border-radius: 10px;
+    overflow: hidden; aspect-ratio: 16/9; max-height: 360px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  video { width: 100%; height: 100%; object-fit: cover; }
+  #camHint { position: absolute; color: #cbd5e1; font-size: 14px; text-align: center; padding: 0 20px; }
+
+  .btn {
+    border: none; border-radius: 9px; padding: 10px 18px; font-size: 15px;
+    cursor: pointer; background: var(--accent); color: #fff; font-weight: 500;
+  }
+  .btn:hover { filter: brightness(1.06); }
+  .btn:disabled { opacity: .5; cursor: not-allowed; }
+  .btn.secondary { background: #eef1f6; color: #33415c; }
+  .btn.danger { background: var(--red); }
+  .btn.small { padding: 5px 10px; font-size: 13px; border-radius: 7px; }
+
+  #dropzone {
+    border: 2px dashed #c3ccdb; border-radius: 12px; padding: 40px 20px;
+    text-align: center; color: var(--muted); cursor: pointer; transition: .15s;
+  }
+  #dropzone:hover, #dropzone.drag { border-color: var(--accent); color: var(--accent); background: #f5f8ff; }
+  #dropzone small { font-size: 13px; }
+
+  .tip { color: var(--muted); font-size: 14px; margin-top: 0; }
+  .manual-row { display: flex; gap: 10px; }
+  .manual-row input {
+    flex: 1; padding: 12px 14px; border: 1px solid #cbd2df; border-radius: 9px;
+    font-size: 15px; font-family: Consolas, monospace;
+  }
+  .manual-row input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(47,107,255,.15); }
+
+  .list-header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; margin-bottom: 12px; }
+  .list-header h2 { margin: 0; font-size: 17px; }
+  .list-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .list-actions input {
+    padding: 8px 12px; border: 1px solid #cbd2df; border-radius: 8px; font-size: 14px; width: 200px;
+  }
+
+  .meta-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
+  .meta-grid label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px; }
+  .meta-grid input {
+    width: 100%; padding: 9px 12px; border: 1px solid #cbd2df; border-radius: 8px; font-size: 14px;
+  }
+  .meta-grid input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(47,107,255,.15); }
+  @media (max-width: 720px) { .meta-grid { grid-template-columns: 1fr; } }
+
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; font-size: 13px; white-space: nowrap; }
+  td.code-cell { font-family: Consolas, monospace; word-break: break-all; max-width: 320px; }
+  .tag { display: inline-block; padding: 2px 8px; border-radius: 20px; font-size: 12px; background: #eef1f6; color: #4b5563; }
+  .tag.dup { background: #fee2e2; color: #991b1b; }
+  .muted { color: var(--muted); font-size: 12px; }
+  #emptyHint { text-align: center; color: var(--muted); padding: 24px; }
+  .note-cell { color: var(--muted); max-width: 180px; word-break: break-all; }
+  .fname { font-weight: 600; word-break: break-all; }
+  .code-sub { color: var(--muted); font-size: 12px; max-width: 300px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .party-line { display: flex; gap: 8px; align-items: baseline; line-height: 1.5; }
+  .party-label { flex: 0 0 auto; width: 3.4em; color: var(--muted); font-size: 12px; }
+  .party-val { flex: 1; word-break: break-all; font-size: 13px; }
+  .tax-cell { font-family: Consolas, monospace; font-size: 13px; word-break: break-all; }
+  .num-cell { font-family: Consolas, monospace; white-space: nowrap; }
+  .invoice-table { width: 100%; border-collapse: collapse; margin-bottom: 12px; font-size: 14px; }
+  .invoice-table th { width: 150px; text-align: left; color: var(--muted); font-weight: 500; padding: 6px 12px 6px 0; border-bottom: 1px solid var(--line); vertical-align: top; white-space: normal; }
+  .invoice-table td { padding: 6px 0; border-bottom: 1px solid var(--line); word-break: break-all; font-family: Consolas, monospace; }
+  .verify-actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 4px; }
+
+  .modal-overlay {
+    position: fixed; inset: 0; background: rgba(15,23,42,.5);
+    display: flex; align-items: center; justify-content: center; z-index: 100; padding: 16px;
+  }
+  .modal {
+    background: #fff; border-radius: 14px; padding: 22px; width: 100%; max-width: 460px;
+    box-shadow: 0 10px 40px rgba(0,0,0,.25);
+  }
+  .modal h3 { margin: 0 0 16px; font-size: 17px; }
+  .modal .field { margin-bottom: 12px; }
+  .modal .field label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px; }
+  .modal .field input, .modal .field textarea {
+    width: 100%; padding: 9px 12px; border: 1px solid #cbd2df; border-radius: 8px;
+    font-size: 14px; font-family: inherit;
+  }
+  .modal .field input:focus, .modal .field textarea:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(47,107,255,.15); }
+  .modal .field textarea { resize: vertical; min-height: 64px; }
+  .modal .actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>🔍 二维码 / 条形码 防重复扫描</h1>
+    <div class="stats">
+      <span>已记录<b id="statTotal">0</b>条</span>
+      <span>累计扫描<b id="statScans">0</b>次</span>
+    </div>
+  </header>
+
+  <div class="banner hidden" id="banner"></div>
+
+  <main>
+    <section class="card">
+      <div class="tabs">
+        <button class="tab active" data-tab="camera">📷 摄像头扫描</button>
+        <button class="tab" data-tab="image">🖼️ 上传图片 / PDF</button>
+        <button class="tab" data-tab="manual">⌨️ 手动 / 扫码枪</button>
+      </div>
+
+      <div id="tab-camera" class="panel">
+        <div class="video-wrap">
+          <video id="video" autoplay playsinline muted></video>
+          <div id="camHint">点击下方按钮开启摄像头<br><small>扫描发票上的二维码 / 条形码</small></div>
+        </div>
+        <div style="margin-top:12px; display:flex; gap:10px; align-items:center;">
+          <button class="btn" id="btnCamera">📷 开启摄像头</button>
+          <span class="muted" id="camStatus"></span>
+        </div>
+      </div>
+
+      <div id="tab-image" class="panel hidden">
+        <div id="dropzone">点击选择 或 拖入图片 / PDF<br><small>支持二维码 / 条形码图片、含二维码的 PDF（电子发票等）</small></div>
+        <input type="file" id="fileInput" accept="image/*,.pdf" multiple hidden>
+      </div>
+
+      <div id="tab-manual" class="panel hidden">
+        <p class="tip">把光标放到输入框，用<b>扫码枪</b>扫一下即自动录入并回车；也可手动输入后回车 / 点「确认」。</p>
+        <div class="manual-row">
+          <input id="manualInput" placeholder="扫描或输入 二维码/条形码内容，回车确认" autocomplete="off">
+          <button class="btn" id="btnManual">确认</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="list-header">
+        <h2>💳 发票信息 / 真伪查验</h2>
+        <span class="muted">真伪以国家税务总局官网查验为准</span>
+      </div>
+      <div id="invoiceEmpty" class="tip">扫描到增值税发票二维码后，这里会显示发票信息，并可一键前往官网查验真伪。</div>
+      <div id="invoicePanel" class="hidden">
+        <table class="invoice-table"><tbody>
+          <tr><th>发票类型</th><td id="invType">—</td></tr>
+          <tr><th>发票代码</th><td id="invCode">—</td></tr>
+          <tr><th>发票号码</th><td id="invNumber">—</td></tr>
+          <tr><th id="invAmountLabel">金额（不含税）</th><td id="invAmount">—</td></tr>
+          <tr><th>开票日期</th><td id="invDate">—</td></tr>
+          <tr><th>校验码</th><td id="invCheck">—</td></tr>
+          <tr><th>随机码</th><td id="invRandom">—</td></tr>
+          <tr><th>购买方名称</th><td id="invBuyerName" style="font-family:inherit">—</td></tr>
+          <tr><th>购买方统一社会信用代码/纳税人识别号</th><td id="invBuyerTax">—</td></tr>
+          <tr><th>销售方名称</th><td id="invSellerName" style="font-family:inherit">—</td></tr>
+          <tr><th>销售方统一社会信用代码/纳税人识别号</th><td id="invSellerTax">—</td></tr>
+          <tr><th>原始内容</th><td id="invRaw">—</td></tr>
+        </tbody></table>
+        <div class="verify-actions">
+          <button class="btn" id="btnOfficial">🔍 前往官网查验真伪</button>
+          <button class="btn secondary" id="btnCopyFields">📋 复制查验要素</button>
+          <button class="btn secondary hidden" id="btnOpenUrl">🔗 打开发票查验链接</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="list-header">
+        <h2>📋 扫描记录</h2>
+        <div class="list-actions">
+          <input id="searchInput" placeholder="🔍 搜索文件名/内容/公司/税号/发票号…">
+          <button class="btn secondary small" id="btnExport">导出 CSV</button>
+          <button class="btn danger small" id="btnClear">清空全部</button>
+        </div>
+      </div>
+      <table id="recordsTable">
+        <thead>
+          <tr>
+            <th>文件 / 内容</th><th>公司名称</th><th>发票号</th><th>统一社会信用代码/纳税人识别号</th><th>类型</th><th>首次扫描</th><th>次数</th><th>操作</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <div id="emptyHint">暂无记录</div>
+    </section>
+  </main>
+
+  <div class="modal-overlay hidden" id="editModal">
+    <div class="modal">
+      <h3>编辑记录</h3>
+      <div class="field"><label>购买方名称</label><input id="editBuyerName" autocomplete="off"></div>
+      <div class="field"><label>购买方统一社会信用代码/纳税人识别号</label><input id="editBuyerTax" autocomplete="off"></div>
+      <div class="field"><label>销售方名称</label><input id="editSellerName" autocomplete="off"></div>
+      <div class="field"><label>销售方统一社会信用代码/纳税人识别号</label><input id="editSellerTax" autocomplete="off"></div>
+      <div class="field"><label>备注</label><textarea id="editNote" placeholder="可留空"></textarea></div>
+      <div class="actions">
+        <button class="btn secondary" id="btnEditCancel">取消</button>
+        <button class="btn" id="btnEditSave">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="jsQR.js"></script>
+  <script src="pdf.min.js"></script>
+  <script src="tesseract/tesseract.min.js"></script>
+  <script>
+  // ==================== 工具函数 ====================
+  const $ = (s) => document.querySelector(s);
+  const FORMATS = ['qr_code','aztec','code_128','code_39','code_93','codabar','data_matrix','ean_13','ean_8','itf','pdf417','upc_a','upc_e'];
+  if (window.pdfjsLib) pdfjsLib.GlobalWorkerOptions.workerSrc = 'pdf.worker.min.js';
+
+  let audioCtx = null;
+  function beep(freq, dur, type = 'sine', vol = 0.28) {
+    try {
+      audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+      if (audioCtx.state === 'suspended') audioCtx.resume();
+      const o = audioCtx.createOscillator();
+      const g = audioCtx.createGain();
+      o.type = type; o.frequency.value = freq;
+      g.gain.setValueAtTime(vol, audioCtx.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + dur);
+      o.connect(g); g.connect(audioCtx.destination);
+      o.start(); o.stop(audioCtx.currentTime + dur);
+    } catch (_) {}
+  }
+  function playNew() { beep(880, .12); setTimeout(() => beep(1318, .16), 130); }
+  function playDuplicate() {
+    beep(220, .2, 'square', .22);
+    setTimeout(() => beep(165, .28, 'square', .22), 200);
+    setTimeout(() => beep(131, .32, 'square', .2), 430);
+  }
+
+  async function api(path, opts = {}) {
+    const res = await fetch(path, {
+      headers: { 'Content-Type': 'application/json' },
+      ...opts,
+      body: opts.body ? JSON.stringify(opts.body) : undefined,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || ('请求失败 ' + res.status));
+    return data;
+  }
+
+  // ==================== 结果提示 ====================
+  const banner = $('#banner');
+  let bannerTimer = null;
+  function showBanner(kind, html) {
+    banner.innerHTML = `<div class="banner-inner ${kind}">${html}</div>`;
+    banner.classList.remove('hidden');
+    clearTimeout(bannerTimer);
+    bannerTimer = setTimeout(() => banner.classList.add('hidden'), 6000);
+  }
+  function esc(s) { return String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+  // ==================== 购买方 / 销售方 信息归一化 ====================
+  function normalizeParties(o) {
+    o = o || {};
+    return {
+      buyerName: String(o.buyerName || '').trim(),
+      buyerTaxId: String(o.buyerTaxId || '').trim().toUpperCase(),
+      sellerName: String(o.sellerName || '').trim(),
+      sellerTaxId: String(o.sellerTaxId || '').trim().toUpperCase(),
+    };
+  }
+
+  // ==================== OCR 识别（Tesseract.js 离线，识别购买方/销售方） ====================
+  let ocrWorker = null;   // Promise<TesseractWorker> 或 null
+  let ocrReady = false;
+  let ocrFailed = false;
+  let ocrStatusCb = null;
+
+  function getOcrWorker() {
+    if (ocrReady && ocrWorker) return Promise.resolve(ocrWorker);
+    if (ocrFailed) return Promise.resolve(null);
+    if (typeof Tesseract === 'undefined') { ocrFailed = true; return Promise.resolve(null); }
+    if (ocrWorker) return ocrWorker;
+    const report = (msg) => { if (ocrStatusCb) ocrStatusCb(msg); };
+    ocrWorker = Tesseract.createWorker('chi_sim', 1, {
+      workerPath: 'tesseract/worker.min.js',
+      corePath: 'tesseract',
+      langPath: 'tesseract/traineddata',
+      workerBlobURL: false,
+      logger: (m) => {
+        if (m.status === 'loading tesseract core' || m.status === 'loading language traineddata' || m.status === 'initializing api') {
+          report('⏳ 正在加载中文识别引擎… ' + Math.round((m.progress || 0) * 100) + '%');
+        }
+      },
+    }).then((w) => { ocrReady = true; return w; })
+      .catch((err) => { console.error('OCR 初始化失败', err); ocrFailed = true; ocrWorker = null; return null; });
+    return ocrWorker;
+  }
+
+  // 对已渲染的 canvas 执行 OCR，返回全文文本（失败返回 null）
+  // 用队列串行执行，避免多个文件/页面并发调用共享 worker 导致识别失败或漏识别
+  let ocrChain = Promise.resolve();
+  function ocrText(canvas, statusCb) {
+    const prev = ocrStatusCb;
+    ocrStatusCb = statusCb || null;
+    const task = ocrChain.then(async () => {
+      try {
+        const worker = await getOcrWorker();
+        if (!worker) return null;
+        const r = await worker.recognize(canvas, {}, { blocks: false, text: true, hocr: false, tsv: false });
+        return (r && r.data && r.data.text) ? r.data.text : null;
+      } catch (e) {
+        console.error('OCR 识别失败', e);
+        return null;
+      }
+    });
+    ocrChain = task.then(() => {}, () => {});
+    return task.finally(() => { ocrStatusCb = prev; });
+  }
+
+  // 从 OCR 全文解析购买方 / 销售方 名称与税号（尽力而为）
+  function parseOcrText(text) {
+    const res = { buyerName: '', buyerTaxId: '', sellerName: '', sellerTaxId: '' };
+    const raw = String(text || '');
+    if (!raw) return res;
+
+    const clean = (s) => String(s || '').replace(/^[：:·、。*\-\s]+/, '').trim();
+    const taxRe = /[0-9][0-9A-Za-z]{14,19}/;
+    const nameLabelRe = /(?:单位名称|名\s*称)/;
+    const taxLabelRe = /(?:统一社会信用代码|纳税人识别号|社会信用代码|纳税识别号|信用代码|识别号|税号)/;
+    const cutRe = /纳税人识别号|统一社会信用代码|社会信用代码|纳税识别号|税号|地址|电话|开户|账号|密码区/;
+    const isNoise = (s) => /名称|纳税人|识别号|信用代码|税号|地址|电话|开户|账号|备注|密码区|购买方|销售方|规格|单位|数量|单价|税率|项目|密码/.test(s);
+
+    // 去空格后逐行切段；同一行可能左右并列「购买方…销售方…」（滴滴数电票等）
+    const lines = raw.split(/\r?\n/).map(l => l.replace(/[\s　]+/g, '')).filter(Boolean);
+    const buyerArr = [], sellerArr = [];
+    let mode = null;
+
+    // 同一行出现两个「名称/税号标签」时，左=购买方、右=销售方
+    const splitDouble = (l) => {
+      const p = [];
+      let m, re = /名\s*称/g;
+      while ((m = re.exec(l))) p.push(m.index);
+      if (p.length >= 2) return [l.slice(0, p[1]), l.slice(p[1])];
+      p.length = 0;
+      re = /统一社会信用代码/g;
+      while ((m = re.exec(l))) p.push(m.index);
+      if (p.length >= 2) return [l.slice(0, p[1]), l.slice(p[1])];
+      p.length = 0;
+      re = /纳税人识别号/g;
+      while ((m = re.exec(l))) p.push(m.index);
+      if (p.length >= 2) return [l.slice(0, p[1]), l.slice(p[1])];
+      return null;
+    };
+
+    for (const l of lines) {
+      const bi = l.search(/购买方|购方|买方|买受方/);
+      const si = l.search(/销售方|销方|卖方|销货方/);
+      if (bi >= 0 && si >= 0) {
+        if (bi <= si) { buyerArr.push(l.slice(bi, si)); sellerArr.push(l.slice(si)); }
+        else { sellerArr.push(l.slice(si, bi)); buyerArr.push(l.slice(bi)); }
+        mode = 'seller';
+      } else if (bi >= 0) { buyerArr.push(l); mode = 'buyer'; }
+      else if (si >= 0) { sellerArr.push(l); mode = 'seller'; }
+      else {
+        const d = splitDouble(l);
+        if (d) { buyerArr.push(d[0]); sellerArr.push(d[1]); mode = 'seller'; }
+        else if (mode === 'buyer') buyerArr.push(l);
+        else if (mode === 'seller') sellerArr.push(l);
+        else buyerArr.push(l); // 未分段的先归入购买方（兜底）
+      }
+    }
+
+    const extract = (arr) => {
+      let name = '', tax = '';
+      for (let i = 0; i < arr.length; i++) {
+        const l = arr[i];
+        if (!tax && taxLabelRe.test(l)) {
+          const m = l.match(taxRe);
+          if (m) tax = m[0].toUpperCase();
+          else if (i + 1 < arr.length) { // 标签与值被 OCR 拆成两行：取下一行的编码
+            const m2 = arr[i + 1].match(taxRe);
+            if (m2) tax = m2[0].toUpperCase();
+          }
+        }
+        if (!name && nameLabelRe.test(l)) {
+          let v = l.replace(nameLabelRe, '').replace(/^[：:·、。*\-\s]+/, '').split(cutRe)[0].trim();
+          if (!v && i + 1 < arr.length) v = clean(arr[i + 1]).split(cutRe)[0].trim();
+          if (v && v.length >= 2 && !isNoise(v)) name = v;
+        }
+        if (name && tax) break;
+      }
+      return { name, tax };
+    };
+
+    const B = extract(buyerArr);
+    const S = extract(sellerArr);
+    res.buyerName = B.name; res.buyerTaxId = B.tax;
+    res.sellerName = S.name; res.sellerTaxId = S.tax;
+
+    // 兜底：补齐缺失字段，按出现顺序：第 1 个 = 购买方，第 2 个 = 销售方
+    const names = [], taxes = [];
+    for (const l of lines) {
+      if (taxLabelRe.test(l)) { const m = l.match(taxRe); if (m && !taxes.includes(m[0])) taxes.push(m[0].toUpperCase()); }
+      if (nameLabelRe.test(l)) {
+        let v = l.replace(nameLabelRe, '').replace(/^[：:·、。*\-\s]+/, '').split(cutRe)[0].trim();
+        if (v && v.length >= 2 && !isNoise(v) && !names.includes(v)) names.push(v);
+      }
+    }
+    if (!res.buyerName) res.buyerName = names[0] || '';
+    if (!res.buyerTaxId) res.buyerTaxId = taxes[0] || '';
+    if (!res.sellerName) res.sellerName = names[1] || '';
+    if (!res.sellerTaxId) res.sellerTaxId = taxes[1] || '';
+
+    // 最后兜底：税号仍缺失时，全文本找 15/18 位的裸编码（统一社会信用代码/纳税人识别号）
+    if (!res.buyerTaxId || !res.sellerTaxId) {
+      const bare = [];
+      for (const l of lines) {
+        const runs = l.match(/[0-9][0-9A-Za-z]+/g) || [];
+        for (const t of runs) {
+          if ((t.length === 15 || t.length === 18) && !bare.includes(t)) bare.push(t.toUpperCase());
+        }
+      }
+      if (!res.buyerTaxId) res.buyerTaxId = bare[0] || '';
+      if (!res.sellerTaxId) res.sellerTaxId = bare[1] || '';
+    }
+
+    return res;
+  }
+
+  // ==================== 数据 ====================
+  async function refreshStats() {
+    try {
+      const s = await api('/api/stats');
+      $('#statTotal').textContent = s.total;
+      $('#statScans').textContent = s.scans;
+    } catch (_) {}
+  }
+  let allRecords = [];
+  async function refreshRecords() {
+    try {
+      const r = await api('/api/records');
+      allRecords = r.records;
+      renderRecords();
+    } catch (_) {}
+  }
+  function renderRecords() {
+    const q = ($('#searchInput').value || '').trim().toLowerCase();
+    const list = allRecords.filter(r => {
+      if (!q) return true;
+      return [r.code, r.note, r.filename, r.buyer_name, r.buyer_tax_id, r.seller_name, r.seller_tax_id]
+        .filter(Boolean).join('\n').toLowerCase().includes(q);
+    });
+    const tbody = $('#recordsTable tbody');
+    tbody.innerHTML = '';
+    $('#emptyHint').classList.toggle('hidden', list.length > 0);
+    $('#recordsTable').classList.toggle('hidden', list.length === 0);
+    for (const r of list) {
+      const tr = document.createElement('tr');
+      const dup = r.scan_count > 1;
+      const inv = parseInvoice(r.code);
+      const sub = inv
+        ? `金额 ${inv.amount || '—'} · ${inv.date ? formatDate(inv.date) : '—'}`
+        : (r.code && r.code.length > 40 ? r.code.slice(0, 40) + '…' : r.code);
+      const main = r.filename
+        ? `<div class="fname">${esc(r.filename)}</div><div class="code-sub" title="${esc(r.code)}">${esc(sub)}</div>`
+        : `<div class="fname">${esc(sub)}</div>`;
+      const noteIcon = r.note ? `<span class="muted" title="备注：${esc(r.note)}">💬</span>` : '';
+      // 购买方 / 销售方 分行显示，标签对齐，避免文字错位
+      const partyLine = (label, v) =>
+        `<div class="party-line"><span class="party-label">${label}</span><span class="party-val">${v ? esc(v) : '<span class="muted">—</span>'}</span></div>`;
+      const nameHtml = partyLine('购买方', r.buyer_name) + partyLine('销售方', r.seller_name);
+      const taxHtml = partyLine('购买方', r.buyer_tax_id) + partyLine('销售方', r.seller_tax_id);
+      tr.innerHTML = `
+        <td class="code-cell">${main}${noteIcon}</td>
+        <td>${nameHtml}</td>
+        <td class="num-cell">${inv && inv.invoiceNumber ? esc(inv.invoiceNumber) : '<span class="muted">—</span>'}</td>
+        <td class="tax-cell">${taxHtml}</td>
+        <td><span class="tag ${dup ? 'dup' : ''}">${esc(r.format || r.type || '—')}</span></td>
+        <td class="muted">${esc(r.first_scanned_at)}</td>
+        <td>${dup ? `<b style="color:var(--red)">${r.scan_count}</b>` : '1'}</td>
+        <td>
+          <button class="btn secondary small" data-edit="${r.id}">编辑</button>
+          <button class="btn danger small" data-del="${r.id}">删除</button>
+        </td>`;
+      tbody.appendChild(tr);
+    }
+  }
+
+  // ==================== 核心：处理扫描内容 ====================
+  // 多个文件/图片同时扫描时，用队列串行处理，避免并发时漏扫（不再因 busy 直接丢弃）
+  let busy = false;               // 仅用于摄像头节流
+  let lastHandled = { code: '', time: 0 };
+  let queue = Promise.resolve();
+
+  function handleCode(raw, type, format, filename, ocr) {
+    const code = String(raw ?? '').trim();
+    if (!code) return queue;
+    const now = Date.now();
+    if (type === 'camera' && lastHandled.code === code && now - lastHandled.time < 3000) return queue; // 摄像头防重复触发
+    lastHandled = { code, time: now };
+    queue = queue.then(() => saveCode(code, type, format, filename, ocr));
+    return queue;
+  }
+
+  async function saveCode(code, type, format, filename, ocr) {
+    busy = true;
+    try {
+      const parties = normalizeParties(ocr);
+      const body = {
+        code, type, format, filename,
+        buyer_name: parties.buyerName,
+        buyer_tax_id: parties.buyerTaxId,
+        seller_name: parties.sellerName,
+        seller_tax_id: parties.sellerTaxId,
+      };
+      const res = await api('/api/scan', { method: 'POST', body });
+      const label = filename
+        ? `文件：<span class="code">${esc(filename)}</span><br><span class="muted" style="font-size:12px">内容：${esc(code)}</span>`
+        : `内容：<span class="code">${esc(code)}</span>`;
+      if (res.duplicate) {
+        const r = res.record;
+        playDuplicate();
+        showBanner('dup', `
+          <div style="font-size:26px;line-height:1">⚠️</div>
+          <div><b>重复扫描！该内容已存在，请勿重复报销</b><br>
+            ${label}<br>
+            首次扫描：${esc(r.first_scanned_at)}　已扫描 <b>${r.scan_count}</b> 次</div>`);
+      } else {
+        playNew();
+        showBanner('ok', `
+          <div style="font-size:26px;line-height:1">✅</div>
+          <div><b>已保存新记录</b><br>${label}</div>`);
+      }
+      updateInvoicePanel(code, parties);
+      refreshStats();
+      refreshRecords();
+    } catch (e) {
+      showBanner('err', `<div style="font-size:26px">❗</div><div><b>保存失败</b><br>${esc(e.message)}</div>`);
+    } finally {
+      busy = false;
+    }
+  }
+
+  // ==================== 摄像头扫描 ====================
+  let stream = null;
+  let detector = null;
+  let cameraRunning = false;
+  const video = $('#video');
+
+  function getDetector() {
+    if (!('BarcodeDetector' in window)) return null;
+    if (!detector) {
+      try { detector = new BarcodeDetector({ formats: FORMATS }); }
+      catch (_) { return null; }
+    }
+    return detector;
+  }
+
+  async function toggleCamera() {
+    const btn = $('#btnCamera');
+    if (cameraRunning) { stopCamera(); return; }
+    if (!getDetector()) {
+      showBanner('err', `<div style="font-size:26px">❗</div><div><b>当前浏览器不支持摄像头识别</b>，请使用 <b>Edge / Chrome</b>，或改用「上传图片 / 手动输入」。</div>`);
+      return;
+    }
+    try {
+      btn.disabled = true;
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } }
+      });
+      video.srcObject = stream;
+      await video.play();
+      $('#camHint').classList.add('hidden');
+      cameraRunning = true;
+      btn.textContent = '🛑 停止摄像头';
+      $('#camStatus').textContent = '扫描中… 对准二维码 / 条形码';
+      tick();
+    } catch (e) {
+      showBanner('err', `<div style="font-size:26px">❗</div><div><b>无法开启摄像头</b>：${esc(e.message)}<br>请确认已允许浏览器访问摄像头。</div>`);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+  function stopCamera() {
+    cameraRunning = false;
+    if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+    video.srcObject = null;
+    $('#btnCamera').textContent = '📷 开启摄像头';
+    $('#camStatus').textContent = '';
+    $('#camHint').classList.remove('hidden');
+  }
+  async function tick() {
+    if (!cameraRunning) return;
+    const det = getDetector();
+    if (video.readyState >= 2 && !busy && det) {
+      try {
+        const codes = await det.detect(video);
+        if (codes && codes.length) {
+          const c = codes[0];
+          handleCode(c.rawValue, 'camera', c.format);
+        }
+      } catch (_) {}
+    }
+    setTimeout(tick, 160);
+  }
+
+  // ==================== 图片扫描 ====================
+  function getDropzone() { return $('#dropzone'); }
+  async function scanImageFile(file) {
+    const dz = getDropzone();
+    const oldHtml = dz.innerHTML;
+    try {
+      const img = await loadImg(file);
+      const canvas = document.createElement('canvas');
+      canvas.width = img.naturalWidth; canvas.height = img.naturalHeight;
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+      ctx.drawImage(img, 0, 0);
+      // 同时用 BarcodeDetector + 多码 jsQR，尽量找全图片里的所有二维码/条形码
+      const codes = await scanCanvas(canvas);
+      if (!codes.length) {
+        showBanner('err', `<div style="font-size:26px">❗</div><div><b>未识别到二维码/条形码</b>，请换一张更清晰的图片（文件：${esc(file.name)}）。</div>`);
+        return;
+      }
+      // OCR 识别购买方 / 销售方 名称与税号（尽力而为）
+      let parties = null;
+      try {
+        const text = await ocrText(canvas, (m) => { dz.innerHTML = m; });
+        if (text) parties = parseOcrText(text);
+      } catch (_) {}
+      dz.innerHTML = oldHtml;
+      for (const c of codes) await handleCode(c.rawValue, 'image', c.format, file.name, parties);
+    } catch (e) {
+      dz.innerHTML = oldHtml;
+      showBanner('err', `<div style="font-size:26px">❗</div><div><b>识别失败</b>：${esc(e.message)}</div>`);
+    }
+  }
+  function loadImg(file) {
+    return new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = reject;
+      img.src = url;
+    });
+  }
+  // 用 jsQR 在一幅图上反复识别多个二维码：每找到一个就涂白该区域，再找下一个
+  function scanJsQRMulti(canvas) {
+    if (typeof jsQR === 'undefined') return [];
+    const codes = [];
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    const w = canvas.width, h = canvas.height;
+    const data = ctx.getImageData(0, 0, w, h);
+    let guard = 0;
+    while (guard++ < 20) {
+      let qr = null;
+      try { qr = jsQR(data.data, w, h); } catch (_) { break; }
+      if (!qr || !qr.data) break;
+      if (!codes.includes(qr.data)) codes.push(qr.data);
+      const loc = qr.location;
+      if (!loc) break;
+      const xs = [loc.topLeftCorner.x, loc.topRightCorner.x, loc.bottomRightCorner.x, loc.bottomLeftCorner.x];
+      const ys = [loc.topLeftCorner.y, loc.topRightCorner.y, loc.bottomRightCorner.y, loc.bottomLeftCorner.y];
+      const x0 = Math.max(0, Math.floor(Math.min(...xs)) - 6);
+      const y0 = Math.max(0, Math.floor(Math.min(...ys)) - 6);
+      const x1 = Math.min(w, Math.ceil(Math.max(...xs)) + 6);
+      const y1 = Math.min(h, Math.ceil(Math.max(...ys)) + 6);
+      for (let y = y0; y < y1; y++) {
+        const row = y * w;
+        for (let x = x0; x < x1; x++) {
+          const i = (row + x) * 4;
+          data.data[i] = 255; data.data[i + 1] = 255; data.data[i + 2] = 255; data.data[i + 3] = 255;
+        }
+      }
+    }
+    return codes;
+  }
+
+  // ==================== PDF 识别 ====================
+  // 对一个已渲染好的 canvas 同时用 BarcodeDetector + 多码 jsQR 识别，去重后返回
+  async function scanCanvas(canvas) {
+    const results = [];
+    const det = getDetector();
+    if (det) {
+      try {
+        const codes = await det.detect(canvas);
+        for (const c of codes) {
+          const v = String(c.rawValue || '').trim();
+          if (v && !results.some(r => r.rawValue === v)) results.push({ rawValue: v, format: c.format });
+        }
+      } catch (_) {}
+    }
+    for (const v of scanJsQRMulti(canvas)) {
+      if (!results.some(r => r.rawValue === v)) results.push({ rawValue: v, format: 'qr_code' });
+    }
+    return results;
+  }
+
+  async function scanPdfFile(file) {
+    const dz = getDropzone();
+    const oldHtml = dz.innerHTML;
+    const setStatus = (msg) => { dz.innerHTML = msg; };
+    setStatus('⏳ 正在解析 PDF：' + esc(file.name) + ' …');
+    let pdf = null;
+    try {
+      const data = await file.arrayBuffer();
+      pdf = await pdfjsLib.getDocument({ data }).promise;
+      const pageCount = pdf.numPages;
+      const found = [];   // { rawValue, format, canvas }
+      for (let i = 1; i <= pageCount; i++) {
+        setStatus('⏳ 正在识别第 ' + i + ' / ' + pageCount + ' 页…');
+        const page = await pdf.getPage(i);
+        const viewport = page.getViewport({ scale: 4 });
+        const canvas = document.createElement('canvas');
+        canvas.width = viewport.width;
+        canvas.height = viewport.height;
+        const ctx = canvas.getContext('2d', { willReadFrequently: true });
+        await page.render({ canvasContext: ctx, viewport }).promise;
+        const codes = await scanCanvas(canvas);
+        if (codes.length) {
+          for (const c of codes) {
+            if (!found.some(x => x.rawValue === c.rawValue)) found.push({ ...c, canvas });
+          }
+        }
+        page.cleanup();
+      }
+      dz.innerHTML = oldHtml;
+      if (!found.length) {
+        showBanner('err', `<div style="font-size:26px">❗</div><div><b>该 PDF 中未识别到二维码/条形码</b>（文件：${esc(file.name)}）。</div>`);
+        return;
+      }
+      // 对含二维码的页面做 OCR，识别购买方 / 销售方 名称与税号（每页只识别一次）
+      const pageParties = new Map();
+      const isEmpty = (p) => !p || (!p.buyerName && !p.buyerTaxId && !p.sellerName && !p.sellerTaxId);
+      let page1Parties; // 兜底：二维码所在页识别不到时，回到第 1 页整页识别
+      const getPage1Parties = async () => {
+        if (page1Parties !== undefined) return page1Parties;
+        page1Parties = null;
+        try {
+          const page = await pdf.getPage(1);
+          const viewport = page.getViewport({ scale: 4 });
+          const canvas = document.createElement('canvas');
+          canvas.width = viewport.width; canvas.height = viewport.height;
+          const ctx = canvas.getContext('2d', { willReadFrequently: true });
+          await page.render({ canvasContext: ctx, viewport }).promise;
+          const text = await ocrText(canvas, (m) => { dz.innerHTML = m; });
+          if (text) page1Parties = parseOcrText(text);
+          page.cleanup();
+        } catch (_) {}
+        return page1Parties;
+      };
+      for (const c of found) {
+        let parties = pageParties.get(c.canvas);
+        if (parties === undefined) {
+          parties = null;
+          try {
+            const text = await ocrText(c.canvas, (m) => { dz.innerHTML = m; });
+            if (text) parties = parseOcrText(text);
+          } catch (_) {}
+          pageParties.set(c.canvas, parties);
+        }
+        if (isEmpty(parties)) parties = await getPage1Parties();
+        dz.innerHTML = oldHtml;
+        await handleCode(c.rawValue, 'pdf', c.format, file.name, parties);
+      }
+    } catch (e) {
+      dz.innerHTML = oldHtml;
+      showBanner('err', `<div style="font-size:26px">❗</div><div><b>PDF 解析失败</b>：${esc(e.message)}</div>`);
+    } finally {
+      try { if (pdf) await pdf.destroy(); } catch (_) {}
+    }
+  }
+
+  // ==================== 发票识别 / 真伪查验 ====================
+  const INVOICE_TYPES = {
+    '01': '增值税专用发票',
+    '02': '增值税普通发票（纸质）',
+    '04': '增值税普通发票（纸质）',
+    '08': '机动车销售统一发票',
+    '10': '增值税电子普通发票',
+    '11': '增值税电子专用发票',
+    '14': '通行费电子发票',
+    '32': '数电票（全电发票）',
+  };
+  const OFFICIAL_URL = 'https://inv-veri.chinatax.gov.cn';
+  let lastInvoice = null;
+  let lastInvoiceUrl = null;
+  let lastParties = null;
+
+  function parseInvoice(code) {
+    if (typeof code !== 'string' || !/^01,/.test(code)) return null;
+    const p = code.split(',');
+    if (p.length < 5) return null;
+    return {
+      invoiceTypeCode: p[1] || '',
+      invoiceType: INVOICE_TYPES[p[1]] || ('代码 ' + p[1]),
+      invoiceCode: p[2] || '',
+      invoiceNumber: p[3] || '',
+      amount: p[4] || '',
+      date: p[5] || '',
+      checkCode: p[6] || '',
+      randomCode: p[7] || '',
+      extra: p.slice(8).filter(Boolean).join(',') || '',
+    };
+  }
+
+  function formatDate(s) {
+    return s && /^\d{8}$/.test(s) ? `${s.slice(0,4)}-${s.slice(4,6)}-${s.slice(6,8)}` : (s || '—');
+  }
+
+  function updateInvoicePanel(code, parties) {
+    const inv = parseInvoice(code);
+    const url = /^https?:\/\//i.test(code) ? code : null;
+    if (!inv && !url) return;
+    $('#invoiceEmpty').classList.add('hidden');
+    $('#invoicePanel').classList.remove('hidden');
+    if (inv) {
+      lastInvoice = inv;
+      const isDigital = inv.invoiceTypeCode === '32';
+      $('#invType').textContent = inv.invoiceType;
+      $('#invCode').textContent = inv.invoiceCode || '—';
+      $('#invNumber').textContent = inv.invoiceNumber || '—';
+      $('#invAmountLabel').textContent = isDigital ? '金额（价税合计）' : '金额（不含税）';
+      $('#invAmount').textContent = inv.amount || '—';
+      $('#invDate').textContent = formatDate(inv.date);
+      $('#invCheck').textContent = inv.checkCode || '—';
+      $('#invRandom').textContent = inv.randomCode || '—';
+      $('#invRaw').textContent = code + (inv.extra ? (',' + inv.extra) : '');
+    }
+    if (parties) lastParties = normalizeParties(parties);
+    renderParties();
+    lastInvoiceUrl = url;
+    $('#btnOpenUrl').classList.toggle('hidden', !url);
+  }
+
+  function renderParties() {
+    const p = lastParties;
+    const nameCell = (v) => v ? esc(v) : '<span class="muted">—</span>';
+    $('#invBuyerName').innerHTML = nameCell(p ? p.buyerName : '');
+    $('#invBuyerTax').innerHTML = p && p.buyerTaxId ? esc(p.buyerTaxId) : '<span class="muted">—</span>';
+    $('#invSellerName').innerHTML = nameCell(p ? p.sellerName : '');
+    $('#invSellerTax').innerHTML = p && p.sellerTaxId ? esc(p.sellerTaxId) : '<span class="muted">—</span>';
+  }
+
+  function copyFields() {
+    if (!lastInvoice) {
+      showBanner('err', `<div style="font-size:26px">❗</div><div><b>暂无发票信息可复制</b></div>`);
+      return;
+    }
+    const parts = [];
+    if (lastInvoice.invoiceCode) parts.push(`发票代码：${lastInvoice.invoiceCode}`);
+    parts.push(`发票号码：${lastInvoice.invoiceNumber}`);
+    parts.push(`开票日期：${lastInvoice.date}`);
+    parts.push(`开具金额(不含税)：${lastInvoice.amount}`);
+    if (lastInvoice.checkCode) parts.push(`校验码：${lastInvoice.checkCode}`);
+    if (lastInvoice.randomCode) parts.push(`随机码：${lastInvoice.randomCode}`);
+    const text = parts.join('\n');
+    const done = () => showBanner('ok', `<div style="font-size:26px">✅</div><div><b>已复制查验要素</b>，可粘贴到官网查验平台。</div>`);
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(done).catch(() => fallbackCopy(text, done));
+    } else {
+      fallbackCopy(text, done);
+    }
+  }
+  function fallbackCopy(text, done) {
+    const ta = document.createElement('textarea');
+    ta.value = text; document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); } catch (_) {}
+    document.body.removeChild(ta);
+    done();
+  }
+
+  // ==================== 编辑记录弹窗 ====================
+  let editingId = null;
+  function openEdit(r) {
+    editingId = r.id;
+    $('#editBuyerName').value = r.buyer_name || '';
+    $('#editBuyerTax').value = r.buyer_tax_id || '';
+    $('#editSellerName').value = r.seller_name || '';
+    $('#editSellerTax').value = r.seller_tax_id || '';
+    $('#editNote').value = r.note || '';
+    $('#editModal').classList.remove('hidden');
+    setTimeout(() => $('#editBuyerName').focus(), 0);
+  }
+  function closeEdit() {
+    editingId = null;
+    $('#editModal').classList.add('hidden');
+  }
+  async function saveEdit() {
+    if (editingId == null) return;
+    try {
+      await api('/api/record', { method: 'POST', body: {
+        id: editingId,
+        buyer_name: $('#editBuyerName').value.trim(),
+        buyer_tax_id: $('#editBuyerTax').value.trim(),
+        seller_name: $('#editSellerName').value.trim(),
+        seller_tax_id: $('#editSellerTax').value.trim(),
+        note: $('#editNote').value.trim(),
+      }});
+      closeEdit();
+      refreshRecords();
+    } catch (e) {
+      showBanner('err', `<div style="font-size:26px">❗</div><div><b>保存失败</b><br>${esc(e.message)}</div>`);
+    }
+  }
+
+  // ==================== 事件绑定 ====================
+  // 标签切换
+  document.querySelectorAll('.tab').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('.panel').forEach(p => p.classList.add('hidden'));
+      btn.classList.add('active');
+      $('#tab-' + btn.dataset.tab).classList.remove('hidden');
+      if (btn.dataset.tab === 'manual') $('#manualInput').focus();
+    });
+  });
+
+  $('#btnCamera').addEventListener('click', toggleCamera);
+  $('#btnOfficial').addEventListener('click', () => window.open(OFFICIAL_URL, '_blank'));
+  $('#btnCopyFields').addEventListener('click', copyFields);
+  $('#btnOpenUrl').addEventListener('click', () => { if (lastInvoiceUrl) window.open(lastInvoiceUrl, '_blank'); });
+
+  const dz = getDropzone();
+  dz.addEventListener('click', () => $('#fileInput').click());
+  dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('drag'); });
+  dz.addEventListener('dragleave', () => dz.classList.remove('drag'));
+  function isPdf(file) { return file.type === 'application/pdf' || /\.pdf$/i.test(file.name); }
+  function handleFile(file) { if (isPdf(file)) scanPdfFile(file); else scanImageFile(file); }
+
+  dz.addEventListener('drop', e => {
+    e.preventDefault(); dz.classList.remove('drag');
+    [...e.dataTransfer.files].forEach(handleFile);
+  });
+  $('#fileInput').addEventListener('change', e => {
+    [...e.target.files].forEach(handleFile);
+    e.target.value = '';
+  });
+
+  function submitManual() {
+    const v = $('#manualInput').value.trim();
+    if (!v) return;
+    $('#manualInput').value = '';
+    handleCode(v, 'manual', '');
+  }
+  $('#btnManual').addEventListener('click', submitManual);
+  $('#manualInput').addEventListener('keydown', e => { if (e.key === 'Enter') submitManual(); });
+
+  // 表格操作（事件委托）
+  $('#recordsTable').addEventListener('click', async (e) => {
+    const editBtn = e.target.closest('[data-edit]');
+    const delBtn = e.target.closest('[data-del]');
+    if (editBtn) {
+      const id = Number(editBtn.dataset.edit);
+      const r = allRecords.find(x => x.id === id);
+      if (r) openEdit(r);
+    }
+    if (delBtn) {
+      const id = Number(delBtn.dataset.del);
+      if (!confirm('确定删除这条记录吗？')) return;
+      await api('/api/records/' + id, { method: 'DELETE' });
+      refreshStats(); refreshRecords();
+    }
+  });
+
+  // 编辑弹窗
+  $('#btnEditSave').addEventListener('click', saveEdit);
+  $('#btnEditCancel').addEventListener('click', closeEdit);
+  $('#editModal').addEventListener('click', (e) => { if (e.target === $('#editModal')) closeEdit(); });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeEdit(); });
+
+  $('#btnClear').addEventListener('click', async () => {
+    if (!confirm('确定清空【全部】扫描记录吗？此操作不可恢复。')) return;
+    await api('/api/records', { method: 'DELETE' });
+    refreshStats(); refreshRecords();
+  });
+
+  $('#btnExport').addEventListener('click', () => {
+    if (!allRecords.length) { alert('暂无记录可导出'); return; }
+    const head = ['文件名','发票号','发票代码','发票类型','金额','开票日期','校验码','随机码','购买方名称','购买方统一社会信用代码/纳税人识别号','销售方名称','销售方统一社会信用代码/纳税人识别号','扫描方式','格式','首次扫描','最近扫描','次数','备注','原始内容'];
+    const rows = allRecords.map(r => {
+      const inv = parseInvoice(r.code);
+      const dateStr = inv && inv.date ? formatDate(inv.date) : '';
+      const vals = [
+        r.filename || '',
+        inv ? inv.invoiceNumber : '',
+        inv ? inv.invoiceCode : '',
+        inv ? inv.invoiceType : '',
+        inv ? inv.amount : '',
+        dateStr,
+        inv ? inv.checkCode : '',
+        inv ? inv.randomCode : '',
+        r.buyer_name || '',
+        r.buyer_tax_id || '',
+        r.seller_name || '',
+        r.seller_tax_id || '',
+        r.type || '',
+        r.format || '',
+        r.first_scanned_at || '',
+        r.last_scanned_at || '',
+        r.scan_count,
+        r.note || '',
+        r.code || '',
+      ];
+      return vals.map(v => '"' + String(v ?? '').replace(/"/g, '""') + '"').join(',');
+    });
+    const csv = '﻿' + [head.map(h => '"' + h + '"').join(','), ...rows].join('\r\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = '扫描记录_' + new Date().toISOString().slice(0,10) + '.csv';
+    a.click();
+  });
+
+  $('#searchInput').addEventListener('input', renderRecords);
+
+  // 初始化
+  refreshStats();
+  refreshRecords();
+  if (!('BarcodeDetector' in window)) {
+    showBanner('err', `<div style="font-size:26px">⚠️</div><div><b>当前浏览器不支持摄像头识别</b>，请使用 <b>Edge / Chrome</b>（仍可上传图片 / 手动输入）。</div>`);
+  }
+  </script>
+</body>
+</html>
