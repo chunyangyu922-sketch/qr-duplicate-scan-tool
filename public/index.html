@@ -838,6 +838,76 @@
     return results;
   }
 
+  // 把 PDF 内嵌图片原始数据解码成 RGBA（kind: 1=1bit灰度, 2=RGB24, 3=RGBA32）
+  function decodePdfImage(img) {
+    const w = img.width, h = img.height;
+    const out = new Uint8ClampedArray(w * h * 4);
+    const data = img.data;
+    if (img.kind === 1) {
+      const rowBytes = Math.ceil(w / 8);
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          const byte = data[y * rowBytes + (x >> 3)];
+          const bit = (byte >> (7 - (x & 7))) & 1;
+          const v = bit ? 255 : 0;   // 白=1
+          const i = (y * w + x) * 4;
+          out[i] = v; out[i + 1] = v; out[i + 2] = v; out[i + 3] = 255;
+        }
+      }
+    } else if (img.kind === 3) {
+      out.set(data);
+    } else if (img.kind === 2) {
+      for (let i = 0, j = 0; i < data.length; i += 3, j += 4) {
+        out[j] = data[i]; out[j + 1] = data[i + 1]; out[j + 2] = data[i + 2]; out[j + 3] = 255;
+      }
+    } else {
+      return null;
+    }
+    return out;
+  }
+  // 最近邻缩放 RGBA（用于二维码多比例识别）
+  function scaleRgba(rgba, w, h, nw, nh) {
+    const out = new Uint8ClampedArray(nw * nh * 4);
+    for (let y = 0; y < nh; y++) {
+      const sy = Math.min(h - 1, (y * h / nh) | 0);
+      for (let x = 0; x < nw; x++) {
+        const sx = Math.min(w - 1, (x * w / nw) | 0);
+        const a = (sy * w + sx) * 4, b = (y * nw + x) * 4;
+        out[b] = rgba[a]; out[b + 1] = rgba[a + 1]; out[b + 2] = rgba[a + 2]; out[b + 3] = 255;
+      }
+    }
+    return out;
+  }
+  // 从 PDF 页内提取原始嵌入图片，用 jsQR 多比例识别二维码（原生 + 2x + 0.5x）。
+  // 直接读取内嵌图片可避免 pdf.js 缩放渲染导致的漏扫：数电票全页大二维码在原生分辨率
+  // 最清晰，小二维码（如京东发票）需 2x 放大。
+  // 注意：图片数据经 worker 异步返回，必须用 objs.get(name, callback) 回调方式等待；
+  // 直接在浏览器里用 objs.get(name) 会报 “Requesting object that isn't resolved yet”。
+  async function scanPageImages(page) {
+    const codes = [];
+    let ops;
+    try { ops = await page.getOperatorList(); } catch (_) { return codes; }
+    for (let k = 0; k < ops.fnArray.length; k++) {
+      if (ops.fnArray[k] !== pdfjsLib.OPS.paintImageXObject) continue;
+      const name = ops.argsArray[k][0];
+      try {
+        const img = await new Promise((resolve) => page.objs.get(name, (d) => resolve(d)));
+        if (!img || !img.data || !img.width || !img.height) continue;
+        const rgba = decodePdfImage(img);
+        if (!rgba) continue;
+        const w = img.width, h = img.height;
+        const attempt = (data, sw, sh) => {
+          if (!data || sw < 21 || sh < 21) return null;
+          try { const r = jsQR(data, sw, sh); return r && r.data ? String(r.data).trim() : null; } catch (_) { return null; }
+        };
+        let hit = attempt(rgba, w, h);                                        // 原生分辨率
+        if (!hit && w * 2 <= 6000 && h * 2 <= 6000) hit = attempt(scaleRgba(rgba, w, h, w * 2, h * 2), w * 2, h * 2); // 2x 放大（小二维码）
+        if (!hit) hit = attempt(scaleRgba(rgba, w, h, w >> 1, h >> 1), w >> 1, h >> 1); // 0.5x 降采样
+        if (hit && !codes.some(c => c.rawValue === hit)) codes.push({ rawValue: hit, format: 'qr_code' });
+      } catch (_) {}
+    }
+    return codes;
+  }
   // 按指定比例渲染页面为 canvas（用于二维码识别与 OCR）
   async function renderPage(page, scale) {
     const viewport = page.getViewport({ scale });
@@ -863,8 +933,13 @@
       for (let i = 1; i <= pageCount; i++) {
         setStatus('⏳ 正在识别第 ' + i + ' / ' + pageCount + ' 页…');
         const page = await pdf.getPage(i);
+        // 先原始分辨率提取内嵌图片二维码（补漏扫，需在渲染前读取，避免 objs 被渲染消费）
+        let codes = await scanPageImages(page);
+        // 再整页渲染，用 BarcodeDetector + jsQR 兜底；同时保留该 canvas 供 OCR 使用
         const canvas = await renderPage(page, 4);
-        const codes = await scanCanvas(canvas);        // BarcodeDetector + jsQR
+        for (const c of await scanCanvas(canvas)) {
+          if (!codes.some(x => x.rawValue === c.rawValue)) codes.push(c);
+        }
         if (codes.length) {
           for (const c of codes) {
             if (!found.some(x => x.rawValue === c.rawValue)) found.push({ ...c, canvas });
