@@ -345,13 +345,17 @@
     if (a.indexOf(b) >= 0) return a;
     return a;
   }
-  // 税号取更“像”合法编码的一条：优先 18 位含字母（统一社会信用代码）或 15 位纯数字（纳税人识别号）
+  // 判断税号是否“像”合法编码：18 位含字母（统一社会信用代码）或 15 位纯数字（纳税人识别号）
+  function isGoodTax(s) {
+    s = String(s || '').trim().toUpperCase();
+    return (s.length === 18 && /[A-Z]/.test(s)) || (s.length === 15 && /^\d{15}$/.test(s));
+  }
+  // 税号取更“像”合法编码的一条
   function preferBetterTax(a, b) {
     a = String(a || '').trim().toUpperCase(); b = String(b || '').trim().toUpperCase();
-    const good = (s) => (s.length === 18 && /[A-Z]/.test(s)) || (s.length === 15 && /^\d{15}$/.test(s));
     if (!a) return b;
     if (!b) return a;
-    const ga = good(a), gb = good(b);
+    const ga = isGoodTax(a), gb = isGoodTax(b);
     if (ga !== gb) return ga ? a : b;
     return b.length > a.length ? b : a;
   }
@@ -369,6 +373,29 @@
   // 购买方/销售方 名称与税号是否已全部识别到
   function isComplete(p) {
     return !!(p && p.buyerName && p.buyerTaxId && p.sellerName && p.sellerTaxId);
+  }
+
+  // 跨页“多数一致”取值：同一 PDF 里所有发票的购买方通常相同（同一报销人），
+  // 单页 OCR 可能把购买方名称首字截断（如「广州」只剩「州」）或税号漏字/多字。
+  // 对每个候选值，统计与其它值“一致”（相等或互为子串）的个数，取覆盖最多者；
+  // 覆盖相同时取更长（更完整）者，这样完整名能盖过被截断的短名。
+  function consensusValue(values) {
+    const list = [];
+    for (const v of values) { const s = String(v || '').trim(); if (s) list.push(s); }
+    if (!list.length) return '';
+    let best = '', bestCov = -1;
+    for (const a of list) {
+      let cov = 0;
+      for (const b of list) if (a === b || a.indexOf(b) >= 0 || b.indexOf(a) >= 0) cov++;
+      if (cov > bestCov || (cov === bestCov && a.length > best.length)) { bestCov = cov; best = a; }
+    }
+    return best;
+  }
+  // 税号只在“合法”值里取多数：18 位含字母或 15 位纯数字，避免把多字/漏字的非法码当共识
+  function consensusTax(values) {
+    const valid = [];
+    for (const v of values) { const s = String(v || '').trim().toUpperCase(); if (isGoodTax(s)) valid.push(s); }
+    return consensusValue(valid); // 无合法税号时返回 ''，不做跨页修正
   }
 
   // ==================== OCR 识别（Tesseract.js 离线，识别购买方/销售方） ====================
@@ -1017,6 +1044,8 @@
         } catch (_) {}
         return page1Parties;
       };
+      // 第一遍：OCR 每页并收集结果，暂不写入
+      const resolved = [];
       for (const c of found) {
         let parties = pageParties.get(c.canvas);
         if (parties === undefined) {
@@ -1027,8 +1056,23 @@
           pageParties.set(c.canvas, parties);
         }
         if (isEmpty(parties)) parties = await getPage1Parties();
+        resolved.push({ c, parties });
+      }
+      // 用跨页“多数一致”值修正单页被截断/缺失的购买方名称与税号（销售方每张票不同，不跨页合并）
+      const buyerName = consensusValue(resolved.map(r => r.parties && r.parties.buyerName));
+      const buyerTaxId = consensusTax(resolved.map(r => r.parties && r.parties.buyerTaxId));
+      for (const { c, parties } of resolved) {
         dz.innerHTML = oldHtml;
-        await handleCode(c.rawValue, 'pdf', c.format, file.name, parties);
+        let p = parties;
+        if (buyerName) {
+          const cur = p ? p.buyerName : '';
+          if (!cur || (buyerName.indexOf(cur) >= 0 && buyerName !== cur)) p = { ...(p || {}), buyerName };
+        }
+        if (buyerTaxId) {
+          const cur = p ? p.buyerTaxId : '';
+          if (!cur || !isGoodTax(cur)) p = { ...(p || {}), buyerTaxId };
+        }
+        await handleCode(c.rawValue, 'pdf', c.format, file.name, p);
       }
     } catch (e) {
       dz.innerHTML = oldHtml;
