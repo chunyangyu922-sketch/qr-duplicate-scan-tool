@@ -330,9 +330,9 @@
     o = o || {};
     return {
       buyerName: String(o.buyerName || '').trim(),
-      buyerTaxId: String(o.buyerTaxId || '').trim().toUpperCase(),
+      buyerTaxId: normalizeTax(o.buyerTaxId),
       sellerName: String(o.sellerName || '').trim(),
-      sellerTaxId: String(o.sellerTaxId || '').trim().toUpperCase(),
+      sellerTaxId: normalizeTax(o.sellerTaxId),
     };
   }
   // 两份结果里取更完整的公司名称：OCR 常把首字截断（如「广州」只剩「州」），
@@ -345,10 +345,56 @@
     if (a.indexOf(b) >= 0) return a;
     return a;
   }
-  // 判断税号是否“像”合法编码：18 位含字母（统一社会信用代码）或 15 位纯数字（纳税人识别号）
+  // 统一社会信用代码校验码（GB 32100-2015）：前 17 位唯一确定第 18 位，
+  // 因此扫描件把最后一位切掉时可以精确还原，而不是猜。
+  const USC_CHARS = '0123456789ABCDEFGHJKLMNPQRTUWXY';
+  const USC_WEIGHTS = [1, 3, 9, 27, 19, 26, 16, 17, 20, 29, 25, 13, 8, 24, 10, 30, 28];
+  function repairUsc(s) {
+    if (s.length !== 17 || !/^[159Y][1-9]\d{6}/.test(s)) return '';
+    let sum = 0;
+    for (let i = 0; i < 17; i++) {
+      const idx = USC_CHARS.indexOf(s[i]);
+      if (idx < 0) return '';
+      sum += idx * USC_WEIGHTS[i];
+    }
+    const c = 31 - (sum % 31);
+    return s + USC_CHARS[(c === 31 ? 0 : c) % 31];
+  }
+  // 规范税号：17 位（被切掉校验位）补齐为 18 位；18 位以校验码为准（第 18 位没有信息量，
+  // 扫描件常把 B 读成 E 之类，用 GB 32100 校验码订正反而更准）
+  function normalizeTax(s) {
+    const code = String(s || '').trim().toUpperCase().replace(/[^0-9A-Z]/g, '');
+    if (code.length === 17) return repairUsc(code) || code;
+    if (code.length >= 18) {
+      const fixed = repairUsc(code.slice(0, 17));
+      // 前 18 位本身就是合法统一社会信用代码时，多出来的位数是粘上去的地址/编号噪声
+      if (fixed && code.length > 18 && fixed === code.slice(0, 18)) return fixed;
+      if (code.length === 18 && fixed && fixed !== code) return fixed;
+    }
+    return code;
+  }
+  // 税号可信度：2=完整合法 1=形态合理但校验位对不上 0=长度可疑 -1=丢弃
+  function taxQuality(s, labeled) {
+    const code = normalizeTax(s);
+    if (/^\d{15}$/.test(code)) return 2;                      // 老版纳税人识别号
+    if (code.length === 18) {
+      if (repairUsc(code.slice(0, 17)) === code) return 2;    // 校验位对得上，完全可信
+      return /[A-Z]/.test(code) ? (labeled ? 1 : 0) : 0;
+    }
+    if (labeled && code.length >= 16 && code.length <= 20 && /^[159Y][1-9]/.test(code)) return 0;
+    return -1;
+  }
+  // 判断税号是否“像”合法编码：18 位统一社会信用代码 或 15 位纯数字纳税人识别号
   function isGoodTax(s) {
-    s = String(s || '').trim().toUpperCase();
-    return (s.length === 18 && /[A-Z]/.test(s)) || (s.length === 15 && /^\d{15}$/.test(s));
+    return taxQuality(s, true) >= 2;
+  }
+  // 税号等级，用于同一销售方多张票之间选优：3=18 位统一社会信用代码且校验位正确，
+  // 2=15 位老版纳税人识别号（发票上偶有旧号，容易和发票号码等数字混淆，优先级更低），
+  // 1=形态合理但校验位对不上，0=长度可疑，-1=丢弃
+  function taxRank(s) {
+    const q = taxQuality(s, true);
+    if (q < 2) return q;
+    return normalizeTax(s).length === 18 ? 3 : 2;
   }
   // 税号取更“像”合法编码的一条
   function preferBetterTax(a, b) {
@@ -431,7 +477,8 @@
     try {
       if (statusCb) statusCb('☁️ 正在使用科大讯飞云端识别…');
       let src = canvas;
-      let dataUrl = src.toDataURL('image/jpeg', 0.9);
+      // 同一张画布可能被反复识别（整页兜底 + 各朝向）：编码一次就够，JPEG 编码大图很费时间
+      let dataUrl = src.__ocrJpeg || (src.__ocrJpeg = src.toDataURL('image/jpeg', 0.9));
       // 科大讯飞要求图片 base64 ≤ 4MB，超出则逐步缩小
       let guard = 0;
       while (dataUrl.length > 3.5 * 1024 * 1024 && guard++ < 3) {
@@ -451,7 +498,7 @@
       });
       const json = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(json.error || '云端识别失败');
-      return { text: json.text || '', parties: json.parties || null };
+      return { text: json.text || '', parties: json.parties || null, candidates: json.candidates || null, invoice: json.invoice || null };
     } catch (e) {
       console.warn('科大讯飞云端识别失败，回退本地识别：', e && e.message);
       return null;
@@ -465,7 +512,7 @@
     return (p.buyerName || p.buyerTaxId || p.sellerName || p.sellerTaxId) ? p : null;
   }
 
-  // 对已渲染的 canvas 识别购买方/销售方信息，返回 { text, parties }（失败返回 null）
+  // 识别购买方 / 销售方 信息（失败返回 null）
   // 用队列串行执行，避免多个文件/页面并发调用共享 worker 导致识别失败或漏识别
   let ocrChain = Promise.resolve();
 
@@ -482,29 +529,113 @@
     }
   }
 
-  function ocrText(canvas, statusCb) {
+  // 单次识别（不纠方向）：优先科大讯飞云端，无结果/失败回退本地 Tesseract；两端结果合并补齐缺失字段
+  function ocrRaw(canvas, statusCb) {
     const prev = ocrStatusCb;
     ocrStatusCb = statusCb || null;
     const task = ocrChain.then(async () => {
-      // 优先科大讯飞云端识别（更准），无结果/失败则回退本地 Tesseract；两端结果合并补齐缺失字段
       const cloud = await cloudOcr(canvas, statusCb);
       let cloudParties = null, cloudText = '';
       if (cloud) { cloudText = cloud.text || ''; cloudParties = cloud.parties ? normalizeParties(cloud.parties) : null; }
       if (cloudText || cloudParties) {
         let merged = normalizeParties(cloudParties);
-        // 云端可能把公司名首字截断（如「广州」只剩「州」）或个别字段漏检，
-        // 故总是用本地 Tesseract 交叉校验，取更长/更完整者补齐
-        const local = await tesseractOcr(canvas);
-        if (local) merged = mergeParties(merged, parseOcrText(local));
-        return { text: cloudText, parties: merged };
+        // 云端可能把公司名首字截断（如「广州」只剩「州」）或个别字段漏检；
+        // 仅在结果不完整或名称明显偏短时才做本地交叉校验，校验到位就不再白跑一遍 Tesseract
+        const cands = { names: [], taxes: [] };
+        if (cloud && cloud.candidates) {
+          for (const n of (cloud.candidates.names || [])) if (n && !cands.names.includes(n)) cands.names.push(String(n).trim());
+          for (const t of (cloud.candidates.taxes || [])) if (t && !cands.taxes.includes(t)) cands.taxes.push(normalizeTax(t));
+        }
+        if (needsLocalCheck(merged)) {
+          const local = await tesseractOcr(canvas);
+          if (local) {
+            const lp = parseOcrText(local);
+            merged = mergeParties(merged, lp);
+            if (lp.candidates) {
+              for (const n of (lp.candidates.names || [])) if (n && !cands.names.includes(n)) cands.names.push(String(n).trim());
+              for (const t of (lp.candidates.taxes || [])) if (t && !cands.taxes.includes(t)) cands.taxes.push(normalizeTax(t));
+            }
+          }
+        }
+        return { text: cloudText, parties: merged, candidates: cands, invoice: cloud.invoice || null };
       }
       // 云端失败：本地 Tesseract
       const local = await tesseractOcr(canvas);
       if (!local) return null;
-      return { text: local, parties: parseOcrText(local) };
+      const lp = parseOcrText(local);
+      return { text: local, parties: lp, candidates: lp.candidates || null };
     });
     ocrChain = task.then(() => {}, () => {});
     return task.finally(() => { ocrStatusCb = prev; });
+  }
+
+  // 识别结果打分：四要素（购买方/销售方名称与税号）齐全且税号合法者得分最高，
+  // 用于在多个候选朝向之间挑出最佳结果（满分 6）
+  function partiesScore(p) {
+    if (!p) return -1;
+    let s = 0;
+    if (p.buyerName) s += 1;
+    if (p.sellerName) s += 1;
+    if (p.buyerTaxId) s += isGoodTax(p.buyerTaxId) ? 2 : 0.5;
+    if (p.sellerTaxId) s += isGoodTax(p.sellerTaxId) ? 2 : 0.5;
+    return s;
+  }
+  // 是否需要本地 Tesseract 交叉校验：字段缺失，或名称短到像是被截断（如只剩「州」）。
+  // 注意别拿「税号校验位对不对」当条件：OCR 少读一位是常事，那样几乎每页都会再跑一遍
+  // Tesseract（整页中文识别要好几秒），扫描速度就是这么慢下来的。
+  function needsLocalCheck(p) {
+    if (!p) return true;
+    if (!p.buyerName || !p.sellerName || !p.buyerTaxId || !p.sellerTaxId) return true;
+    return p.buyerName.length < 4 || p.sellerName.length < 4;
+  }
+
+  // 按朝向识别发票：发票可能横放 / 倒放，OCR 对非正置图片会漏掉公司名与税号。
+  // 先按二维码推出的角度纠正（最可能正确），四要素不齐时再依次尝试其它角度，取得分最高者。
+  async function ocrParties(canvas, hintDeg, statusCb) {
+    const order = [];
+    for (const d of [hintDeg || 0, 0, 90, 180, 270]) {
+      const dd = ((Math.round(d / 90) * 90) % 360 + 360) % 360;
+      if (!order.includes(dd)) order.push(dd);
+    }
+    let best = null, bestScore = -1, bestInvoice = null;
+    const names = [], taxes = [];
+    const addCands = (c) => {
+      if (!c) return;
+      for (const v of c.names || []) if (v && !names.includes(v)) names.push(v);
+      for (const v of c.taxes || []) { const t = normalizeTax(v); if (t && !taxes.includes(t)) taxes.push(t); }
+    };
+    for (const deg of order) {
+      let r = null;
+      try { r = await ocrRaw(rotateCanvas(canvas, -deg), statusCb); } catch (_) {}
+      const p = toParties(r);
+      const sc = partiesScore(p);
+      if (sc > bestScore) { bestScore = sc; best = p; bestInvoice = (r && r.invoice) || bestInvoice; }
+      addCands(r && r.candidates);
+      if (isComplete(best)) break;   // 四要素齐备，无需再试其它角度（每多试一个朝向就多一次云端调用）
+    }
+    // 各朝向的候选合并后取交集校验：某个角度没读出来的税号，其它角度可能读到了
+    return { parties: best, score: bestScore, candidates: names.length || taxes.length ? { names, taxes } : null, invoice: bestInvoice };
+  }
+
+  // 二维码解不出来时的兜底（打印后扫描的发票，二维码被网点糊掉）：用讯飞读票面文字，
+  // 读出「发票号码」就按票号当去重键，整张发票才不会因为码糊了而被漏掉。
+  // 只试一个朝向：整页兜底若按 4 个朝向各调一次云端，成本翻 4 倍；朝向不对时票号多半也读不出来，
+  // 此时宁可漏掉这一页（封面、行程单、正文页本来就没有票号），也不误报。
+  async function fallbackByOcr(canvas, statusCb, hintDeg) {
+    // 整页横放 / 倒置时先按检测到的朝向转正再识别，否则票号大概率读不出来（该页就被漏掉）
+    const deg = ((Math.round((hintDeg || 0) / 90) * 90) % 360 + 360) % 360;
+    const cv = deg ? rotateCanvas(canvas, -deg) : canvas;
+    let r = null;
+    try { r = await ocrRaw(cv, statusCb); } catch (_) {}
+    if (cv !== canvas) releaseCanvas(cv);
+    const inv = (r && r.invoice) || null;
+    const no = String((inv && inv.number) || '').replace(/\D/g, '');
+    if (no.length < 15) return null;   // 没识别到发票号码：不是发票页，跳过
+    return {
+      item: { canvas, codes: [{ rawValue: invoicePayloadNoQr(no, inv), format: '无码识别', type: 'qr', cx: null, cy: null, rotation: 0 }], rotation: 0 },
+      parties: toParties(r),
+      cands: (r && r.candidates) || null,
+    };
   }
 
   // 从 OCR 全文解析购买方 / 销售方 名称与税号（尽力而为）
@@ -614,7 +745,157 @@
       if (!res.sellerTaxId) res.sellerTaxId = bare[1] || '';
     }
 
+    // 全部候选（不做左右归属），供跨票交叉印证使用
+    const taxCands = [];
+    for (const t of taxes.concat(bare)) {
+      const c = normalizeTax(t);
+      if (c && taxQuality(c, true) >= 0 && !taxCands.includes(c)) taxCands.push(c);
+    }
+    res.candidates = { names: names.slice(), taxes: taxCands };
     return res;
+  }
+
+  // ==================== PDF 文字层（电子发票 PDF 优先走这里） ====================
+  // 从平台下载的电子发票 PDF（滴滴、航司、电商等）票面本身就是文字，不是图片。
+  // 直接读文字层比 OCR 又快又准：不用调云端接口（省钱省时间），也不会把「广州」读成「州」。
+  // 扫描件没有文字层，仍然走原来的 OCR 流程。
+  async function pdfPageItems(page) {
+    try {
+      const tc = await page.getTextContent();
+      const items = [];
+      for (const it of (tc.items || [])) {
+        const s = String(it.str == null ? '' : it.str).replace(/[\s　]+/g, '').trim();
+        if (!s) continue;
+        const m = it.transform || [];
+        items.push({ s, x: Number(m[4]) || 0, y: Number(m[5]) || 0 });
+      }
+      return items;
+    } catch (_) { return []; }
+  }
+
+  // 文字层 → 购买方 / 销售方 + 发票要素。返回 { parties, candidates, invoice }，认不出时 parties 为 null。
+  // 数电票版式固定：购买方信息在左、销售方信息在右，两栏各是「名称」+「统一社会信用代码」。
+  // 找不到「购买方/销售方」这两个栏目标签就不猜（宁可交给 OCR），避免把买卖方写反。
+  function partiesFromPdfText(items) {
+    const out = { parties: null, candidates: null, invoice: null };
+    if (!items || items.length < 8) return out;
+    const nameRe = /[一-龥A-Za-z0-9（）()·]{2,}(?:有限责任公司|股份有限公司|有限公司|医院|学校|大学|学院|中心|店|厂|集团|公司|事务所|合作社|银行|支行|分行|车站|宾馆|酒店|餐厅|餐饮|门诊部|诊所)/;
+    const isNoise = (s) => /名称|纳税人|识别号|信用代码|税号|地址|电话|开户|账号|备注|密码区|规格|单位|数量|单价|税率|项目|购买方|销售方|信息/.test(s);
+    const numRe = /[0-9][0-9A-Za-z]{14,19}/;
+    // 栏目标签锚点：文字层常把「购买方信息」逐字拆成 购|买|方|信|息 —— 竖排时相邻两字
+    // 是上下关系（x 相同、y 差约 11），不一定在同一行，所以两个方向都要认
+    const anchorPos = (first, second) => {
+      for (const a of items) {
+        if (a.s !== first) continue;
+        const b = items.find(o => o.s === second && Math.abs(o.x - a.x) < 40 && (Math.abs(o.y - a.y) < 40));
+        if (b) return { x: Math.min(a.x, b.x), y: Math.max(a.y, b.y), vert: Math.abs(b.x - a.x) < 4 };
+      }
+      const whole = items.find(o => o.s.indexOf(first + second) === 0);
+      return whole ? { x: whole.x, y: whole.y, vert: false } : null;
+    };
+    const buyA = anchorPos('购', '买');
+    const sellA = anchorPos('销', '售');
+    if (!buyA || !sellA) return out;
+    // 分栏：数电票左=购买方、右=销售方。以销售方栏的起始 x 为界（购买方栏目较宽，
+    // 税号值可能跨过两栏中点，按“列首”切才稳）；两栏上下叠放时改用 y 切
+    const lr = Math.abs(buyA.x - sellA.x) >= 40;
+    const boundary = lr ? sellA.x : sellA.y;
+    const pick = (list) => {
+      let buyer = null, seller = null;
+      for (const v of list) {
+        const isSeller = lr ? (v.x >= boundary - 4) : (v.y >= boundary - 4);
+        if (!isSeller) { if (!buyer || v.x < buyer.x) buyer = v; }
+        else if (!seller || v.x > seller.x) seller = v;
+      }
+      return { buyer, seller };
+    };
+
+    const nameItems = [], taxItems = [];
+    for (const it of items) {
+      if (it.s.length >= 4 && !isNoise(it.s)) {
+        const m = it.s.match(nameRe);
+        if (m && !nameItems.some(n => n.s === m[0])) nameItems.push({ s: m[0], x: it.x, y: it.y });
+      }
+      for (const c of (it.s.match(new RegExp(numRe.source, 'g')) || [])) {
+        const code = normalizeTax(c);
+        if (taxQuality(code, false) < 0 || taxItems.some(t => t.code === code)) continue;
+        taxItems.push({ code, x: it.x, y: it.y });
+      }
+    }
+    const np = pick(nameItems);
+    const tp = pick(taxItems);
+    const parties = normalizeParties({
+      buyerName: np.buyer ? np.buyer.s : '',
+      buyerTaxId: tp.buyer ? tp.buyer.code : '',
+      sellerName: np.seller ? np.seller.s : '',
+      sellerTaxId: tp.seller ? tp.seller.code : '',
+    });
+    if (!parties.buyerName && !parties.sellerName && !parties.buyerTaxId && !parties.sellerTaxId) return out;
+
+    // 发票号码：认「发票号码」标签右侧（或同一块里）那个 15~25 位数字
+    const label = items.find(o => o.s.indexOf('发票号码') === 0);
+    let invoiceNo = '';
+    if (label) {
+      const inline = label.s.match(/\d{15,25}/);
+      if (inline) invoiceNo = inline[0];
+      else {
+        let best = null;
+        for (const o of items) {
+          if (!/^\d{15,25}$/.test(o.s)) continue;
+          const d = Math.abs(o.y - label.y) * 4 + Math.abs(o.x - label.x);
+          if (!best || d < best.d) best = { d, s: o.s };
+        }
+        if (best) invoiceNo = best.s;
+      }
+    } else {
+      const o = items.find(v => /^\d{19,25}$/.test(v.s));
+      if (o) invoiceNo = o.s;
+    }
+    // 开票日期
+    let invoiceDate = '';
+    const dm = items.map(o => o.s.match(/(\d{4})年(\d{1,2})月(\d{1,2})日/)).find(Boolean);
+    if (dm) invoiceDate = `${dm[1]}${String(dm[2]).padStart(2, '0')}${String(dm[3]).padStart(2, '0')}`;
+    // 价税合计（小写）：取「小写 / 价税合计」标签右侧最近的那个金额
+    let amount = null;
+    for (const o of items) {
+      if (o.s.indexOf('小写') < 0 && o.s.indexOf('价税合计') < 0) continue;
+      let best = null;
+      for (const c of items) {
+        if (!/^\d+(\.\d{1,2})?$/.test(c.s) || c.x < o.x || Math.abs(c.y - o.y) > 30) continue;
+        const d = Math.abs(c.x - o.x);
+        if (!best || d < best.d) best = { d, v: Number(c.s) };
+      }
+      if (best) { amount = best.v; break; }
+    }
+
+    out.parties = parties;
+    out.candidates = {
+      names: nameItems.map(n => n.s),
+      taxes: taxItems.map(t => t.code),
+    };
+    out.invoice = { number: invoiceNo, amount, date: invoiceDate };
+    return out;
+  }
+
+  // 没有二维码时用文字层读到的发票号码当去重键（与无码兜底同一套载荷格式）
+  function noQrItemFromText(canvas, tr) {
+    const inv = (tr && tr.invoice) || null;
+    const no = String((inv && inv.number) || '').replace(/\D/g, '');
+    if (no.length < 15) return null;
+    return {
+      item: { canvas, codes: [{ rawValue: invoicePayloadNoQr(no, inv), format: '无码识别', type: 'qr', cx: null, cy: null, rotation: 0 }], rotation: 0 },
+      parties: toParties(tr),
+      cands: (tr && tr.candidates) || null,
+    };
+  }
+
+  // 组装成与扫码结果相同的载荷：01,<票种>,<发票代码>,<发票号码>,<金额>,<开票日期>,<校验码>,<随机码>
+  // 同一张发票之前可能已经用完好的二维码扫过（或本批前面已存过）：按票号找回那条记录，
+  // 复用它已有的 code 当去重键 —— 否则金额/日期识别上的细微差别会再存出一条重复记录
+  function invoicePayloadNoQr(no, inv) {
+    const raw = ['01', '32', '', no, inv && inv.amount != null ? inv.amount : '', (inv && inv.date) || '', '', ''].join(',');
+    const hit = allRecords.find(r => { const iv = parseInvoice(r.code); return iv && iv.invoiceNumber === no; });
+    return hit ? hit.code : raw;
   }
 
   // ==================== 数据 ====================
@@ -796,6 +1077,192 @@
 
   // ==================== 图片扫描 ====================
   function getDropzone() { return $('#dropzone'); }
+
+  // 逐个「发票区域」识别购买方 / 销售方（每个区域优先科大讯飞云端识别，并按二维码朝向纠正方向）。
+  // 区域被裁切或识别不到时，用整页结果补齐购买方字段；同一份文件里购买方通常相同，
+  // 单张可能被截断或漏字，故再对跨票结果取「多数一致」值修正。销售方每张票不同，不跨票合并。
+  // 返回 [{ item, parties }]，item.codes 为该区域内的二维码。
+  async function recognizeItems(items, statusCb, sharedCache) {
+    const emptyOf = (p) => !p || (!p.buyerName && !p.buyerTaxId && !p.sellerName && !p.sellerTaxId);
+    const cache = sharedCache || new Map();   // 二维码集合 → 识别结果（同一张发票重复出现时复用，省一次调用）
+    const baseCache = new Map();  // 整页 canvas → Promise<parties>（惰性整页识别，用于兜底）
+    const getBase = (cv, rot) => {
+      if (!baseCache.has(cv)) {
+        baseCache.set(cv, (async () => {
+          try {
+            const r = await ocrParties(cv, rot || 0, statusCb);
+            return emptyOf(r.parties) ? null : r.parties;
+          } catch (_) { return null; }
+        })());
+      }
+      return baseCache.get(cv);
+    };
+
+    const resolved = [];
+    for (const it of items) {
+      const base = it.pageCanvas || it.canvas;
+      const baseRot = it.pageRotation || 0;
+      const key = it.codes.map(c => c.rawValue).sort().join('|');
+      // 文字层里四要素齐全（电子发票 PDF）：直接用，省掉整个 OCR 流程
+      const tr = it.textRes || null;
+      const tp = tr && tr.parties;
+      if (tp && isComplete(tp) && isGoodTax(tp.buyerTaxId) && isGoodTax(tp.sellerTaxId)) {
+        resolved.push({ item: it, parties: tp, cands: tr.candidates || null, fromText: true });
+        if (it.canvas !== base) releaseCanvas(it.canvas);
+        continue;
+      }
+      let parties, cands = null;
+      if (cache.has(key)) {
+        ({ parties, cands } = cache.get(key));
+      } else {
+        parties = null;
+        try {
+          const r = await ocrParties(it.canvas, it.rotation || 0, statusCb);
+          parties = emptyOf(r.parties) ? null : r.parties;
+          cands = r.candidates || null;
+        } catch (_) {}
+        cache.set(key, { parties, cands });
+      }
+      // 文字层虽然不全，但读到的那部分比 OCR 更可靠：用它补齐 OCR 没读到的字段
+      if (tp && !emptyOf(tp)) {
+        parties = parties ? mergeParties(parties, tp) : normalizeParties(tp);
+        const c = { names: [], taxes: [] };
+        for (const src of [cands, tr.candidates]) {
+          for (const n of ((src && src.names) || [])) if (n && !c.names.includes(n)) c.names.push(n);
+          for (const t of ((src && src.taxes) || [])) { const v = normalizeTax(t); if (v && !c.taxes.includes(v)) c.taxes.push(v); }
+        }
+        cands = c;
+      }
+      // 区域不是整页时，用整页结果补齐缺失的购买方名称 / 税号（区域切分可能把抬头切到邻区）
+      if (base !== it.canvas && (!parties || !parties.buyerName || !isGoodTax(parties.buyerTaxId))) {
+        const fp = await getBase(base, baseRot);
+        if (fp) {
+          parties = parties || normalizeParties({});
+          if (!parties.buyerName && fp.buyerName) parties = { ...parties, buyerName: fp.buyerName };
+          if (!isGoodTax(parties.buyerTaxId) && fp.buyerTaxId) parties = { ...parties, buyerTaxId: fp.buyerTaxId };
+        }
+      }
+      if (emptyOf(parties) && base !== it.canvas) {
+        const fp = await getBase(base, baseRot);
+        if (fp) parties = fp;
+      }
+      resolved.push({ item: it, parties, cands });
+      if (it.canvas !== base) releaseCanvas(it.canvas);   // 区域画布用完即释放
+    }
+    // 整页画布也不再需要，一并释放（长篇 PDF 逐页处理，避免内存堆积）
+    for (const cv of new Set(resolved.map(r => r.item.pageCanvas || r.item.canvas))) releaseCanvas(cv);
+    return resolved;
+  }
+
+  // 同一批发票的购买方通常相同（同一报销人）：据此在整份文件内交叉印证、修正购买方字段。
+  // 名称取「多数一致」的完整值；税号还额外汇总每张票上出现的全部候选 —— 横放/倒置的发票
+  // 坐标不可靠，讯飞可能把购买方税号归到销售方名下，用「出现在最多张发票上的税号」纠正回来。
+  // 销售方每张票都不同，不跨票合并。
+  function applyBuyerConsensus(resolved) {
+    const buyerName = consensusValue(resolved.map(r => r.parties && r.parties.buyerName));
+    const consensusBuyerTax = consensusTax(resolved.map(r => r.parties && r.parties.buyerTaxId));
+    // 汇总所有税号候选，统计各出现在多少张发票上
+    const counts = new Map();
+    for (const r of resolved) {
+      const set = new Set(((r.cands && r.cands.taxes) || []).map(normalizeTax).filter(Boolean));
+      for (const t of set) counts.set(t, (counts.get(t) || 0) + 1);
+    }
+    // 购买方税号不可能同时是某张票「已确定归属」的销售方税号：同一家供应商开了多张票时，
+    // 该销售方税号出现次数也会 ≥2，必须排除，否则会被误当购买方税号。
+    // 只采信购买方栏确实装着本批购买方的那几张票 —— 左右装反的票会把它放进销售方栏。
+    const sameOrgEarly = (a, b) => !!a && !!b && (a === b || a.indexOf(b) >= 0 || b.indexOf(a) >= 0);
+    const sellerOwned = new Set();
+    for (const r of resolved) {
+      const p = r.parties || {};
+      if (!sameOrgEarly(p.buyerName, buyerName)) continue;
+      if (p.buyerTaxId && isGoodTax(p.buyerTaxId) && p.sellerTaxId && isGoodTax(p.sellerTaxId)) sellerOwned.add(normalizeTax(p.sellerTaxId));
+    }
+    let crossBuyerTax = '';
+    for (const [t, n] of counts) {
+      if (n < 2 || sellerOwned.has(t)) continue;  // 只出现一次或已归属销售方，无法判断
+      const bn = counts.get(crossBuyerTax) || 0;
+      if (!crossBuyerTax || n > bn || (n === bn && taxQuality(t, true) > taxQuality(crossBuyerTax, true))) crossBuyerTax = t;
+    }
+    const buyerTaxId = crossBuyerTax || consensusBuyerTax;
+
+    // 名称“属同一家”判定：相等或互为子串（OCR 常截首字，如「广州」只剩「州」）
+    const sameOrg = (a, b) => !!a && !!b && (a === b || a.indexOf(b) >= 0 || b.indexOf(a) >= 0);
+    for (const r of resolved) {
+      let p = r.parties;
+      // 左右装反：讯飞在非正置图片上会把购买方栏认成销售方栏（本票购买方名称跑到销售方栏）。
+      // 这批发票的购买方是同一家（consensus），据此可判定是否装反，并把名称与税号一并换回来。
+      if (buyerName && p && !sameOrg(p.buyerName, buyerName) && sameOrg(p.sellerName, buyerName)) {
+        const restCands = [p.buyerTaxId, ...((r.cands && r.cands.taxes) || [])]
+          .map(normalizeTax)
+          .filter(c => c && c !== crossBuyerTax && taxRank(c) >= 2);
+        restCands.sort((a, b) => taxRank(b) - taxRank(a));   // 优先 18 位统一社会信用代码
+        p = {
+          buyerName,
+          buyerTaxId: crossBuyerTax || p.sellerTaxId,
+          sellerName: p.buyerName,                       // 装反时销售方名称在购买方栏
+          sellerTaxId: restCands[0] || '',
+        };
+      }
+      if (buyerName) {
+        const cur = p ? p.buyerName : '';
+        if (!cur || (buyerName.indexOf(cur) >= 0 && buyerName !== cur)) p = { ...(p || {}), buyerName };
+      }
+      if (buyerTaxId) {
+        const cur = p ? p.buyerTaxId : '';
+        if (!cur || !isGoodTax(cur)) {
+          // 购买方税号缺失或不可信：若销售方那一栏正是它，说明归错了边，换回来，
+          // 并把另一个候选（如果识别到）给销售方；否则直接补上
+          let sellerTax = p ? p.sellerTaxId : '';
+          if (sellerTax === buyerTaxId) {
+            sellerTax = ((r.cands && r.cands.taxes) || [])
+              .map(normalizeTax)
+              .find(c => c && c !== buyerTaxId && taxQuality(c, true) >= 0) || '';
+          }
+          p = { ...(p || {}), buyerTaxId, sellerTaxId: sellerTax };
+        }
+      }
+      r.parties = p;
+    }
+    // 同一销售方（名称完全相同）在同一份报销单里税号必然相同：用它自己另一张票上
+    // 读得更全的税号补齐漏读的那张（如同一家滴滴旗下公司开了多张行程票）
+    const bySeller = new Map();
+    for (const r of resolved) {
+      const p = r.parties || {};
+      const n = (p.sellerName || '').trim();
+      const t = normalizeTax(p.sellerTaxId);
+      if (!n || taxRank(t) < 2) continue;
+      const cur = bySeller.get(n);
+      if (!cur || taxRank(t) > taxRank(cur)) bySeller.set(n, t);
+    }
+    for (const r of resolved) {
+      const p = r.parties || {};
+      const n = (p.sellerName || '').trim();
+      const best = bySeller.get(n);
+      if (!best || best === normalizeTax(p.sellerTaxId)) continue;
+      if (taxRank(normalizeTax(p.sellerTaxId)) < taxRank(best)) r.parties = { ...p, sellerTaxId: best };
+    }
+    return resolved;
+  }
+
+  // 把二维码按位置切分成「每张发票一个区域」，同一张图里拼了多张发票时各自识别，避免漏字段
+  function itemsFromSources(sources, filename) {
+    const items = [];
+    const seen = new Set();
+    for (const src of sources) {
+      for (const reg of codeRegions(src.canvas, src.codes)) {
+        const codes = reg.codes.filter(c => c.rawValue && !seen.has(c.rawValue));
+        if (!codes.length) { if (reg.canvas !== src.canvas) releaseCanvas(reg.canvas); continue; }
+        codes.forEach(c => seen.add(c.rawValue));
+        items.push({
+          codes, canvas: reg.canvas, filename,
+          rotation: (codes[0] && codes[0].rotation) || src.rotation || 0,
+          pageCanvas: src.canvas, pageRotation: src.rotation || 0,
+        });
+      }
+    }
+    return items;
+  }
+
   async function scanImageFile(file) {
     const dz = getDropzone();
     const oldHtml = dz.innerHTML;
@@ -805,20 +1272,29 @@
       canvas.width = img.naturalWidth; canvas.height = img.naturalHeight;
       const ctx = canvas.getContext('2d', { willReadFrequently: true });
       ctx.drawImage(img, 0, 0);
-      // 同时用 BarcodeDetector + 多码 jsQR，尽量找全图片里的所有二维码/条形码
+      // BarcodeDetector + 多比例多码 jsQR，尽量找全图片里的所有二维码/条形码
       const scanned = await scanCanvas(canvas);
       if (!scanned.results.length) {
+        // 二维码糊掉解不出（打印后扫描的发票）：用讯飞读票面文字，识别到发票号码就按票号兜底去重，
+        // 免得整张发票被漏掉；读不到票号（普通照片、票据截图）才提示换图
+        const noQr = await fallbackByOcr(canvas, (m) => { dz.innerHTML = m; });
+        dz.innerHTML = oldHtml;
+        if (noQr) {
+          for (const { item, parties } of applyBuyerConsensus([noQr])) {
+            for (const c of item.codes) await handleCode(c.rawValue, 'image', c.format, file.name, parties);
+          }
+          return;
+        }
         showBanner('err', `<div style="font-size:26px">❗</div><div><b>未识别到二维码/条形码</b>，请换一张更清晰的图片（文件：${esc(file.name)}）。</div>`);
         return;
       }
-      // 整页倒置时先纠正方向，再 OCR 识别购买方 / 销售方 名称与税号（尽力而为）
-      const ocrCanvas = rotateCanvas(canvas, -scanned.rotation);
-      let parties = null;
-      try {
-        parties = toParties(await ocrText(ocrCanvas, (m) => { dz.innerHTML = m; }));
-      } catch (_) {}
+      // 一张图里可能拼了多张发票：按二维码位置切分，每张单独识别并纠正朝向
+      const items = itemsFromSources([{ canvas, codes: scanned.results, rotation: scanned.rotation }], file.name);
+      const resolved = applyBuyerConsensus(await recognizeItems(items, (m) => { dz.innerHTML = m; }));
       dz.innerHTML = oldHtml;
-      for (const c of scanned.results) await handleCode(c.rawValue, 'image', c.format, file.name, parties);
+      for (const { item, parties } of resolved) {
+        for (const c of item.codes) await handleCode(c.rawValue, 'image', c.format, file.name, parties);
+      }
     } catch (e) {
       dz.innerHTML = oldHtml;
       showBanner('err', `<div style="font-size:26px">❗</div><div><b>识别失败</b>：${esc(e.message)}</div>`);
@@ -856,22 +1332,30 @@
     ctx.drawImage(canvas, -w / 2, -h / 2);
     return out;
   }
-  // 用 jsQR 在一幅图上反复识别多个二维码：每找到一个就涂白该区域，再找下一个。
-  // 返回 { codes, rotation }，rotation 取自首个二维码（整页朝向）。
-  function scanJsQRMulti(canvas) {
+  // 在一份 RGBA 像素上反复识别多个二维码：每找到一个就涂白该区域，再找下一个。
+  // 返回 { codes, rotation }：codes 含 rawValue / format / 中心坐标(cx,cy) / 自身朝向(rotation)。
+  function jsQRMultiRgba(rgba, w, h, maxFind) {
     const out = { codes: [], rotation: 0 };
-    if (typeof jsQR === 'undefined') return out;
-    const ctx = canvas.getContext('2d', { willReadFrequently: true });
-    const w = canvas.width, h = canvas.height;
-    const data = ctx.getImageData(0, 0, w, h);
+    if (typeof jsQR === 'undefined' || !rgba) return out;
+    const data = rgba;
+    const limit = maxFind || 24;
     let guard = 0, rotationSet = false;
-    while (guard++ < 20) {
+    while (guard++ < limit) {
       let qr = null;
-      try { qr = jsQR(data.data, w, h); } catch (_) { break; }
+      try { qr = jsQR(data, w, h); } catch (_) { break; }
       if (!qr || !qr.data) break;
-      if (!out.codes.includes(qr.data)) out.codes.push(qr.data);
-      if (!rotationSet && qr.location) { out.rotation = qrRotationAngle(qr.location); rotationSet = true; }
       const loc = qr.location;
+      const rot = loc ? qrRotationAngle(loc) : 0;
+      const value = String(qr.data).trim();
+      if (value && !out.codes.some(c => c.rawValue === value)) {
+        let cx = null, cy = null;
+        if (loc) {
+          cx = (loc.topLeftCorner.x + loc.topRightCorner.x + loc.bottomRightCorner.x + loc.bottomLeftCorner.x) / 4;
+          cy = (loc.topLeftCorner.y + loc.topRightCorner.y + loc.bottomRightCorner.y + loc.bottomLeftCorner.y) / 4;
+        }
+        out.codes.push({ rawValue: value, format: 'qr_code', cx, cy, rotation: rot });
+      }
+      if (!rotationSet && loc) { out.rotation = rot; rotationSet = true; }
       if (!loc) break;
       const xs = [loc.topLeftCorner.x, loc.topRightCorner.x, loc.bottomRightCorner.x, loc.bottomLeftCorner.x];
       const ys = [loc.topLeftCorner.y, loc.topRightCorner.y, loc.bottomRightCorner.y, loc.bottomLeftCorner.y];
@@ -883,16 +1367,99 @@
         const row = y * w;
         for (let x = x0; x < x1; x++) {
           const i = (row + x) * 4;
-          data.data[i] = 255; data.data[i + 1] = 255; data.data[i + 2] = 255; data.data[i + 3] = 255;
+          data[i] = 255; data[i + 1] = 255; data[i + 2] = 255; data[i + 3] = 255;
         }
       }
     }
     return out;
   }
 
+  // 在一幅画布上多比例识别二维码：原比例最通用；找不到时再降采样（大图更稳）或放大（小二维码更清晰）
+  function scanQrInCanvas(canvas) {
+    const w = canvas.width, h = canvas.height;
+    if (!w || !h) return { codes: [], rotation: 0 };
+    let src = null;
+    try { src = canvas.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, w, h).data; } catch (_) { return { codes: [], rotation: 0 }; }
+    const variants = [1, 0.5];
+    if (w * h * 16 <= 48 * 1024 * 1024) variants.push(2);   // 小图才放大 2x，避免大页内存暴涨
+    for (const s of variants) {
+      const sw = s === 1 ? w : Math.max(21, Math.round(w * s));
+      const sh = s === 1 ? h : Math.max(21, Math.round(h * s));
+      let buf;
+      try { buf = s === 1 ? new Uint8ClampedArray(src) : scaleRgba(src, w, h, sw, sh); } catch (_) { continue; }
+      const r = jsQRMultiRgba(buf, sw, sh);
+      if (r.codes.length) {
+        if (s !== 1) for (const c of r.codes) { if (c.cx != null) { c.cx /= s; c.cy /= s; } }
+        return r;
+      }
+    }
+    return { codes: [], rotation: 0 };
+  }
+
+  // 裁剪画布的一块矩形区域（把同页多张发票分开识别）
+  function cropCanvas(src, x, y, w, h) {
+    const c = document.createElement('canvas');
+    c.width = Math.max(1, Math.round(w));
+    c.height = Math.max(1, Math.round(h));
+    c.getContext('2d').drawImage(src, Math.round(x), Math.round(y), c.width, c.height, 0, 0, c.width, c.height);
+    return c;
+  }
+  // 释放画布占用（长篇 PDF 逐页处理时避免内存堆积）
+  function releaseCanvas(c) {
+    try { if (c) { c.width = 0; c.height = 0; delete c.__ocrJpeg; } } catch (_) {}
+  }
+  // 把 RGBA 原始像素画成 canvas（识别 PDF 内嵌图片用），超过 maxDim 时等比缩小
+  function canvasFromRgba(rgba, w, h, maxDim) {
+    maxDim = maxDim || 4000;
+    const scale = Math.max(w, h) > maxDim ? maxDim / Math.max(w, h) : 1;
+    const cw = Math.max(1, Math.round(w * scale)), ch = Math.max(1, Math.round(h * scale));
+    const c = document.createElement('canvas');
+    c.width = cw; c.height = ch;
+    const ctx = c.getContext('2d');
+    try {
+      if (scale === 1) {
+        ctx.putImageData(new ImageData(rgba, w, h), 0, 0);
+      } else {
+        const t = document.createElement('canvas');
+        t.width = w; t.height = h;
+        t.getContext('2d').putImageData(new ImageData(rgba, w, h), 0, 0);
+        ctx.drawImage(t, 0, 0, cw, ch);
+        releaseCanvas(t);
+      }
+    } catch (_) { return c; }
+    return c;
+  }
+
+  // 依据二维码位置把一幅画布切成若干「发票区域」：同一页里上下（或左右）拼接的多张发票
+  // 必须各自单独识别，否则共用一次 OCR 结果会让部分发票的购买方/销售方信息张冠李戴或丢失。
+  function codeRegions(canvas, codes) {
+    const w = canvas.width, h = canvas.height;
+    const pts = codes.filter(c => c.cx != null && c.cy != null);
+    if (codes.length <= 1 || pts.length < 2) return codes.map(c => ({ codes: [c], canvas }));
+    const xs = pts.map(c => c.cx), ys = pts.map(c => c.cy);
+    const xSpread = Math.max(...xs) - Math.min(...xs);
+    const ySpread = Math.max(...ys) - Math.min(...ys);
+    const vertical = ySpread >= xSpread;             // 上下排列 → 按 y 切分；左右排列 → 按 x 切分
+    const key = vertical ? 'cy' : 'cx';
+    const size = vertical ? h : w;
+    const sorted = [...codes].sort((a, b) => (a[key] || 0) - (b[key] || 0));
+    const mid = (a, b) => Math.round(((a[key] || 0) + (b[key] || 0)) / 2);
+    const out = [];
+    for (let i = 0; i < sorted.length; i++) {
+      const start = i === 0 ? 0 : Math.max(0, mid(sorted[i - 1], sorted[i]));
+      const end = i === sorted.length - 1 ? size : Math.max(start + 1, mid(sorted[i], sorted[i + 1]));
+      const len = Math.max(1, end - start);
+      const whole = (start === 0 && len === size);
+      const cv = whole ? canvas : (vertical ? cropCanvas(canvas, 0, start, w, len) : cropCanvas(canvas, start, 0, len, h));
+      out.push({ codes: [sorted[i]], canvas: cv });
+    }
+    return out;
+  }
+
   // ==================== PDF 识别 ====================
-  // 对一个已渲染好的 canvas 同时用 BarcodeDetector + 多码 jsQR 识别，去重后返回
-  // 返回 { results, rotation }，rotation 用于整页倒置时先纠正方向再 OCR
+  // 对一个已渲染好的 canvas 同时用 BarcodeDetector + 多比例多码 jsQR 识别，去重后返回
+  // 返回 { results, rotation }，rotation 用于整页倒置/横放时先纠正方向再 OCR；
+  // results 里带二维码中心坐标，供同页多张发票切分使用。
   async function scanCanvas(canvas) {
     const results = [];
     const det = getDetector();
@@ -901,15 +1468,21 @@
         const codes = await det.detect(canvas);
         for (const c of codes) {
           const v = String(c.rawValue || '').trim();
-          if (v && !results.some(r => r.rawValue === v)) results.push({ rawValue: v, format: c.format });
+          if (!v || results.some(r => r.rawValue === v)) continue;
+          const bb = c.boundingBox || null;
+          results.push({
+            rawValue: v, format: c.format, rotation: 0,
+            cx: bb ? bb.x + bb.width / 2 : null,
+            cy: bb ? bb.y + bb.height / 2 : null,
+          });
         }
       } catch (_) {}
     }
-    const js = scanJsQRMulti(canvas);
-    for (const v of js.codes) {
-      if (!results.some(r => r.rawValue === v)) results.push({ rawValue: v, format: 'qr_code' });
+    const qr = scanQrInCanvas(canvas);
+    for (const c of qr.codes) {
+      if (!results.some(r => r.rawValue === c.rawValue)) results.push(c);
     }
-    return { results, rotation: js.rotation };
+    return { results, rotation: qr.rotation };
   }
 
   // 把 PDF 内嵌图片原始数据解码成 RGBA（kind: 1=1bit灰度, 2=RGB24, 3=RGBA32）
@@ -939,7 +1512,17 @@
     }
     return out;
   }
-  // 最近邻缩放 RGBA（用于二维码多比例识别）
+  // pdf.js 直接把图片解成 ImageBitmap 时（无 data 字段）：画到画布上再取像素
+  function rgbaFromBitmap(bmp, w, h) {
+    if (!bmp) return null;
+    try {
+      const c = document.createElement('canvas');
+      c.width = w; c.height = h;
+      const ctx = c.getContext('2d', { willReadFrequently: true });
+      ctx.drawImage(bmp, 0, 0, w, h);
+      return new Uint8ClampedArray(ctx.getImageData(0, 0, w, h).data);
+    } catch (_) { return null; }
+  }
   function scaleRgba(rgba, w, h, nw, nh) {
     const out = new Uint8ClampedArray(nw * nh * 4);
     for (let y = 0; y < nh; y++) {
@@ -952,35 +1535,62 @@
     }
     return out;
   }
-  // 从 PDF 页内提取原始嵌入图片，用 jsQR 多比例识别二维码（原生 + 2x + 0.5x）。
-  // 直接读取内嵌图片可避免 pdf.js 缩放渲染导致的漏扫：数电票全页大二维码在原生分辨率
-  // 最清晰，小二维码（如京东发票）需 2x 放大。
+  // 从 PDF 页内提取原始嵌入图片，逐张识别二维码，返回 [{ canvas, codes }]。
+  // 直接读取内嵌图片可避免 pdf.js 缩放渲染导致的漏扫：数电票全页大二维码在原生分辨率最清晰，
+  // 小二维码（如京东发票）需 2x 放大。返回的 canvas 就是该图片本身，OCR 直接识别它即可，
+  // 这样一页里拼了多张发票时，每张发票的信息都归属到它自己的二维码，不会串页或漏字段。
   // 注意：图片数据经 worker 异步返回，必须用 objs.get(name, callback) 回调方式等待；
   // 直接在浏览器里用 objs.get(name) 会报 “Requesting object that isn't resolved yet”。
   async function scanPageImages(page) {
-    const codes = [];
+    const out = [];
     let ops;
-    try { ops = await page.getOperatorList(); } catch (_) { return codes; }
+    try { ops = await page.getOperatorList(); } catch (_) { return out; }
+    const seen = new Set();
+    const handleImg = async (img) => {
+      if (!img || !img.width || !img.height) return;
+      if (img.width < 24 || img.height < 24) return;      // 图标等小图直接跳过（不可能含发票二维码）
+      // 浏览器里 pdf.js 对部分图片只给 ImageBitmap（没有 data 字段）：这类图漏掉就会整页扫不出码
+      const rgba = img.data ? decodePdfImage(img) : rgbaFromBitmap(img.bitmap, img.width, img.height);
+      if (!rgba) return;
+      const w = img.width, h = img.height;
+      const attempt = (data, sw, sh) => {
+        if (!data || sw < 21 || sh < 21) return { codes: [], rotation: 0 };
+        try { return jsQRMultiRgba(data, sw, sh); } catch (_) { return { codes: [], rotation: 0 }; }
+      };
+      let hit = attempt(new Uint8ClampedArray(rgba), w, h);                                  // 原生分辨率
+      if (!hit.codes.length && w * 2 <= 6000 && h * 2 <= 6000) hit = attempt(scaleRgba(rgba, w, h, w * 2, h * 2), w * 2, h * 2); // 2x 放大
+      if (!hit.codes.length && w >= 42 && h >= 42) hit = attempt(scaleRgba(rgba, w, h, w >> 1, h >> 1), w >> 1, h >> 1);          // 0.5x 降采样
+      const cv = canvasFromRgba(rgba, w, h);
+      const codes = hit.codes.slice();
+      // 条形码 / 部分二维码 jsQR 认不出，用系统 BarcodeDetector 在图片本身上再兜一层
+      if (!codes.length) {
+        const det = getDetector();
+        if (det) {
+          try {
+            const r = await det.detect(cv);
+            for (const c of r) {
+              const v = String(c.rawValue || '').trim();
+              if (v) codes.push({ rawValue: v, format: c.format, cx: null, cy: null, rotation: 0 });
+            }
+          } catch (_) {}
+        }
+      }
+      if (!codes.length) { releaseCanvas(cv); return; }
+      out.push({ canvas: cv, codes });
+    };
     for (let k = 0; k < ops.fnArray.length; k++) {
-      if (ops.fnArray[k] !== pdfjsLib.OPS.paintImageXObject) continue;
-      const name = ops.argsArray[k][0];
-      try {
-        const img = await new Promise((resolve) => page.objs.get(name, (d) => resolve(d)));
-        if (!img || !img.data || !img.width || !img.height) continue;
-        const rgba = decodePdfImage(img);
-        if (!rgba) continue;
-        const w = img.width, h = img.height;
-        const attempt = (data, sw, sh) => {
-          if (!data || sw < 21 || sh < 21) return null;
-          try { const r = jsQR(data, sw, sh); return r && r.data ? String(r.data).trim() : null; } catch (_) { return null; }
-        };
-        let hit = attempt(rgba, w, h);                                        // 原生分辨率
-        if (!hit && w * 2 <= 6000 && h * 2 <= 6000) hit = attempt(scaleRgba(rgba, w, h, w * 2, h * 2), w * 2, h * 2); // 2x 放大（小二维码）
-        if (!hit) hit = attempt(scaleRgba(rgba, w, h, w >> 1, h >> 1), w >> 1, h >> 1); // 0.5x 降采样
-        if (hit && !codes.some(c => c.rawValue === hit)) codes.push({ rawValue: hit, format: 'qr_code' });
-      } catch (_) {}
+      const fn = ops.fnArray[k];
+      if (fn === pdfjsLib.OPS.paintImageXObject) {
+        const name = ops.argsArray[k][0];
+        if (!name || seen.has(name)) continue;
+        seen.add(name);
+        try { const img = await new Promise((resolve) => page.objs.get(name, (d) => resolve(d))); await handleImg(img); } catch (_) {}
+      } else if (fn === pdfjsLib.OPS.paintInlineImageXObject) {
+        // 内嵌图片（无对象名，数据直接在操作数里）：老式扫描件 PDF 常见，不处理会整页漏扫
+        try { await handleImg(ops.argsArray[k][0]); } catch (_) {}
+      }
     }
-    return codes;
+    return out;
   }
   // 按指定比例渲染页面为 canvas（用于二维码识别与 OCR）
   async function renderPage(page, scale) {
@@ -995,6 +1605,8 @@
 
   async function scanPdfFile(file) {
     const dz = getDropzone();
+    const lastTip = dz.querySelector('#pdfMissTip');   // 上一个文件的漏扫提示，先清掉再备份原样
+    if (lastTip) lastTip.remove();
     const oldHtml = dz.innerHTML;
     const setStatus = (msg) => { dz.innerHTML = msg; };
     setStatus('⏳ 正在解析 PDF：' + esc(file.name) + ' …');
@@ -1003,76 +1615,75 @@
       const data = await file.arrayBuffer();
       pdf = await pdfjsLib.getDocument({ data }).promise;
       const pageCount = pdf.numPages;
-      const found = [];   // { rawValue, format, canvas }
+      const resolved = [];       // 全部页面的识别结果（{ item, parties }）
+      const missed = [];         // 既没二维码、也没读到发票号码的页（封面 / 行程单 / 正文页）
+      const ocrCache = new Map();
+      const seenCodes = new Set();
       for (let i = 1; i <= pageCount; i++) {
         setStatus('⏳ 正在识别第 ' + i + ' / ' + pageCount + ' 页…');
         const page = await pdf.getPage(i);
-        // 先原始分辨率提取内嵌图片二维码（补漏扫，需在渲染前读取，避免 objs 被渲染消费）
-        let codes = await scanPageImages(page);
-        // 再整页渲染，用 BarcodeDetector + jsQR 兜底；同时检测整页是否倒置（rotation）
-        const canvas = await renderPage(page, 4);
-        const scanned = await scanCanvas(canvas);
-        for (const c of scanned.results) {
-          if (!codes.some(x => x.rawValue === c.rawValue)) codes.push(c);
-        }
-        if (codes.length) {
-          // 倒置时先纠正方向，OCR 才能识别出购买方/销售方名称与税号
-          const ocrCanvas = rotateCanvas(canvas, -scanned.rotation);
-          for (const c of codes) {
-            if (!found.some(x => x.rawValue === c.rawValue)) found.push({ ...c, canvas: ocrCanvas });
+        // 0) 文字层：电子发票 PDF（滴滴、航司、平台下载的）票面就是文字，直接读比 OCR 又快又准。
+        //    读不到（扫描件没有文字层）就返回空，仍走下面的图片 / 整页 OCR 流程。
+        const textRes = partiesFromPdfText(await pdfPageItems(page));
+        const sources = [];
+        // 1) 内嵌图片（扫描件 / 多张发票拼成的 PDF）：图片本身即一张发票，按原始分辨率识别最准，
+        //    需在整页渲染前读取，避免图片对象被渲染消费掉
+        try {
+          for (const img of await scanPageImages(page)) {
+            sources.push({ canvas: img.canvas, codes: img.codes, rotation: (img.codes[0] && img.codes[0].rotation) || 0 });
           }
-        }
+        } catch (_) {}
+        // 2) 整页渲染兜底：BarcodeDetector + 多比例多码 jsQR，并检测整页朝向（横放 / 倒置）
+        //    只渲染 2 倍：2 倍已是原始扫描图（1656x2339）的两倍，二维码足够大；4 倍会到
+        //    6624x9356，getImageData 一次要 248MB，浏览器里往往分配失败 → 兜底扫描静默失效
+        const canvas = await renderPage(page, 2);
+        const scanned = await scanCanvas(canvas);
+        const extra = scanned.results.filter(c => !sources.some(s => s.codes.some(x => x.rawValue === c.rawValue)));
+        if (extra.length) sources.push({ canvas, codes: extra, rotation: scanned.rotation });
         page.cleanup();
+        // 同一页里重复出现的二维码只处理一次（整页渲染与内嵌图片可能识别到同一个码）
+        const fresh = [];
+        for (const s of sources) {
+          const codes = s.codes.filter(c => c.rawValue && !seenCodes.has(c.rawValue));
+          if (!codes.length) { if (s.canvas !== canvas) releaseCanvas(s.canvas); continue; }
+          codes.forEach(c => seenCodes.add(c.rawValue));
+          fresh.push({ canvas: s.canvas, codes, rotation: s.rotation });
+        }
+        if (!fresh.length) {
+          // 本页二维码解不出来（常见于打印后扫描件，二维码已被网点糊掉）：用讯飞读票面文字兜底。
+          // 识别到发票号码就用它当去重键，避免整张发票被漏掉；识别不到（封面、行程单、正文页）则跳过。
+          // 电子发票 PDF 的文字层里直接就有发票号码，先试文字层，一次云端调用都不用。
+          const noQr = noQrItemFromText(canvas, textRes) || await fallbackByOcr(canvas, setStatus, scanned.rotation);
+          releaseCanvas(canvas);
+          if (noQr) resolved.push(noQr); else missed.push(i);   // 没读到的页记下来，扫描结束时报给用户
+          continue;
+        }
+        // 每个区域都挂上整页画布：区域识别不全时可用整页结果补齐购买方字段。
+        // 逐页做完 OCR 并释放画布，长 PDF 才不会把整本的页面都留在内存里。
+        const pageItems = itemsFromSources(fresh, file.name);
+        for (const it of pageItems) { it.pageCanvas = canvas; it.pageRotation = scanned.rotation; it.textRes = textRes; }
+        const pageResolved = await recognizeItems(pageItems, setStatus, ocrCache);
+        for (const r of pageResolved) resolved.push(r);
       }
       dz.innerHTML = oldHtml;
-      if (!found.length) {
-        showBanner('err', `<div style="font-size:26px">❗</div><div><b>该 PDF 中未识别到二维码/条形码</b>（文件：${esc(file.name)}）。</div>`);
+      if (!resolved.length) {
+        showBanner('err', `<div style="font-size:26px">❗</div><div><b>该 PDF 中未识别到二维码/条形码，票面也未读到发票号码</b>（文件：${esc(file.name)}）。</div>`);
         return;
       }
-      // 对含二维码的页面做 OCR，识别购买方 / 销售方 名称与税号（每页只识别一次）
-      const pageParties = new Map();
-      const isEmpty = (p) => !p || (!p.buyerName && !p.buyerTaxId && !p.sellerName && !p.sellerTaxId);
-      let page1Parties; // 兜底：二维码所在页识别不到时，回到第 1 页整页识别
-      const getPage1Parties = async () => {
-        if (page1Parties !== undefined) return page1Parties;
-        page1Parties = null;
-        try {
-          const page = await pdf.getPage(1);
-          const canvas = await renderPage(page, 4);
-          page1Parties = toParties(await ocrText(canvas, (m) => { dz.innerHTML = m; }));
-          page.cleanup();
-        } catch (_) {}
-        return page1Parties;
-      };
-      // 第一遍：OCR 每页并收集结果，暂不写入
-      const resolved = [];
-      for (const c of found) {
-        let parties = pageParties.get(c.canvas);
-        if (parties === undefined) {
-          parties = null;
-          try {
-            parties = toParties(await ocrText(c.canvas, (m) => { dz.innerHTML = m; }));
-          } catch (_) {}
-          pageParties.set(c.canvas, parties);
-        }
-        if (isEmpty(parties)) parties = await getPage1Parties();
-        resolved.push({ c, parties });
+      // 未识别的页码提示在虚线框下方（不覆盖右侧的“已保存/重复”提醒，避免漏看重复告警）
+      if (missed.length) {
+        const tip = document.createElement('div');
+        tip.id = 'pdfMissTip';
+        tip.className = 'muted';
+        tip.style.cssText = 'font-size:12px;margin-top:8px;line-height:1.6';
+        tip.textContent = `本文件共 ${pageCount} 页：识别到 ${resolved.length} 项；`
+          + `第 ${missed.join('、')} 页未读到二维码/发票号码（多为封面、行程单、正文页，也可能票面太糊）。`;
+        dz.appendChild(tip);
       }
-      // 用跨页“多数一致”值修正单页被截断/缺失的购买方名称与税号（销售方每张票不同，不跨页合并）
-      const buyerName = consensusValue(resolved.map(r => r.parties && r.parties.buyerName));
-      const buyerTaxId = consensusTax(resolved.map(r => r.parties && r.parties.buyerTaxId));
-      for (const { c, parties } of resolved) {
-        dz.innerHTML = oldHtml;
-        let p = parties;
-        if (buyerName) {
-          const cur = p ? p.buyerName : '';
-          if (!cur || (buyerName.indexOf(cur) >= 0 && buyerName !== cur)) p = { ...(p || {}), buyerName };
-        }
-        if (buyerTaxId) {
-          const cur = p ? p.buyerTaxId : '';
-          if (!cur || !isGoodTax(cur)) p = { ...(p || {}), buyerTaxId };
-        }
-        await handleCode(c.rawValue, 'pdf', c.format, file.name, p);
+      // 跨票修正购买方名称与税号后写入
+      applyBuyerConsensus(resolved);
+      for (const { item, parties } of resolved) {
+        for (const c of item.codes) await handleCode(c.rawValue, 'pdf', c.format, file.name, parties);
       }
     } catch (e) {
       dz.innerHTML = oldHtml;

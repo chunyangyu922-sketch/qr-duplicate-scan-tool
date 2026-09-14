@@ -22,6 +22,12 @@ config.json
 # 日志
 *.log
 
+# 本地诊断脚本与中间产物
+_diag_new.js
+_dump_*.png
+_pipe_cache*.json
+_t_before.txt
+
 # 系统文件
 .DS_Store
 Thumbs.db

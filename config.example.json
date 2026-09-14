@@ -1,11 +1,12 @@
 {
   "xfyun": {
+    "mode": "newapi",
     "appid": "你的APPID",
-    "apisecret": "你的APISecret",
     "apikey": "你的APIKey",
-    "templateList": "vat_invoice",
+    "apisecret": "你的APISecret",
     "host": "api.xf-yun.com",
-    "path": "/v1/private/s824758f1",
-    "serviceId": "s824758f1"
+    "path": "/v1/private/你的serviceId",
+    "serviceId": "你的serviceId",
+    "templateList": "vat_invoice"
   }
 }

@@ -22,6 +22,8 @@
      识别到发票后会自动 OCR 识别整页票面文字，自动提取购买方 / 销售方名称
      与统一社会信用代码（纳税人识别号），例如滴滴电子发票会同时保存购买方和
      销售方的名称与税号。
+     一份 PDF 扫描完后，如果有个别页面没读到二维码 / 发票号码，虚线框下方会
+     列出这些页码，方便核对是否漏了发票（封面、行程单、正文页属于正常情况）。
   3) 手动 / 扫码枪：把光标放到输入框，用 USB 扫码枪扫一下会自动录入；
      也可以手动输入内容后回车。
 
@@ -48,9 +50,12 @@
   默认使用本地 Tesseract OCR（离线、免费），对清晰票面即可识别。
   如希望提升识别准确度，可申请科大讯飞增值税发票识别服务，并在本程序目录
   新建 config.json 文件（可直接复制 config.example.json 后填写），内容：
-    { "xfyun": { "appid": "…", "apisecret": "…", "apikey": "…",
-                 "templateList": "vat_invoice", "host": "api.xf-yun.com",
-                 "path": "/v1/private/s824758f1", "serviceId": "s824758f1" } }
+    { "xfyun": { "mode": "newapi", "appid": "…", "apikey": "…", "apisecret": "…",
+                 "host": "api.xf-yun.com", "path": "/v1/private/…",
+                 "serviceId": "…", "templateList": "vat_invoice" } }
+  appid / apikey / apisecret / serviceId 都在讯飞控制台该服务的页面里。
+  另有一套老版 WebAPI 接口（webapi.xfyun.cn）也支持，把 mode 改成 "webapi"，
+  并改用 { "appid", "apikey", "url", "engineType" } 这几个字段即可。
   密钥仅保存在服务端 config.json（已被 .gitignore 排除，不会被提交），
   不会发送到浏览器。配置后，识别发票会优先走云端（更准），
   失败或无结果时自动回退本地 OCR。
