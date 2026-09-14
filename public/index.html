@@ -335,15 +335,35 @@
       sellerTaxId: String(o.sellerTaxId || '').trim().toUpperCase(),
     };
   }
-  // 合并两份识别结果，缺失字段用另一份补齐（base 优先）
+  // 两份结果里取更完整的公司名称：OCR 常把首字截断（如「广州」只剩「州」），
+  // 当较短者恰是较长者的一部分（子串）时，说明被截断，取较长者；否则保持 base 不变。
+  function preferLonger(a, b) {
+    a = String(a || '').trim(); b = String(b || '').trim();
+    if (!a) return b;
+    if (!b) return a;
+    if (b.indexOf(a) >= 0) return b;
+    if (a.indexOf(b) >= 0) return a;
+    return a;
+  }
+  // 税号取更“像”合法编码的一条：优先 18 位含字母（统一社会信用代码）或 15 位纯数字（纳税人识别号）
+  function preferBetterTax(a, b) {
+    a = String(a || '').trim().toUpperCase(); b = String(b || '').trim().toUpperCase();
+    const good = (s) => (s.length === 18 && /[A-Z]/.test(s)) || (s.length === 15 && /^\d{15}$/.test(s));
+    if (!a) return b;
+    if (!b) return a;
+    const ga = good(a), gb = good(b);
+    if (ga !== gb) return ga ? a : b;
+    return b.length > a.length ? b : a;
+  }
+  // 合并两份识别结果：名称取更完整者，税号取更合法者，缺失字段用另一份补齐
   function mergeParties(base, add) {
     const b = normalizeParties(base);
     const a = normalizeParties(add);
     return normalizeParties({
-      buyerName: b.buyerName || a.buyerName,
-      buyerTaxId: b.buyerTaxId || a.buyerTaxId,
-      sellerName: b.sellerName || a.sellerName,
-      sellerTaxId: b.sellerTaxId || a.sellerTaxId,
+      buyerName: preferLonger(b.buyerName, a.buyerName),
+      buyerTaxId: preferBetterTax(b.buyerTaxId, a.buyerTaxId),
+      sellerName: preferLonger(b.sellerName, a.sellerName),
+      sellerTaxId: preferBetterTax(b.sellerTaxId, a.sellerTaxId),
     });
   }
   // 购买方/销售方 名称与税号是否已全部识别到
@@ -445,11 +465,10 @@
       if (cloud) { cloudText = cloud.text || ''; cloudParties = cloud.parties ? normalizeParties(cloud.parties) : null; }
       if (cloudText || cloudParties) {
         let merged = normalizeParties(cloudParties);
-        if (!isComplete(merged)) {
-          // 云端漏检个别字段（如某些页缺销售方税号）：用本地 Tesseract 补齐
-          const local = await tesseractOcr(canvas);
-          if (local) merged = mergeParties(merged, parseOcrText(local));
-        }
+        // 云端可能把公司名首字截断（如「广州」只剩「州」）或个别字段漏检，
+        // 故总是用本地 Tesseract 交叉校验，取更长/更完整者补齐
+        const local = await tesseractOcr(canvas);
+        if (local) merged = mergeParties(merged, parseOcrText(local));
         return { text: cloudText, parties: merged };
       }
       // 云端失败：本地 Tesseract
@@ -760,18 +779,19 @@
       const ctx = canvas.getContext('2d', { willReadFrequently: true });
       ctx.drawImage(img, 0, 0);
       // 同时用 BarcodeDetector + 多码 jsQR，尽量找全图片里的所有二维码/条形码
-      const codes = await scanCanvas(canvas);
-      if (!codes.length) {
+      const scanned = await scanCanvas(canvas);
+      if (!scanned.results.length) {
         showBanner('err', `<div style="font-size:26px">❗</div><div><b>未识别到二维码/条形码</b>，请换一张更清晰的图片（文件：${esc(file.name)}）。</div>`);
         return;
       }
-      // OCR 识别购买方 / 销售方 名称与税号（尽力而为）
+      // 整页倒置时先纠正方向，再 OCR 识别购买方 / 销售方 名称与税号（尽力而为）
+      const ocrCanvas = rotateCanvas(canvas, -scanned.rotation);
       let parties = null;
       try {
-        parties = toParties(await ocrText(canvas, (m) => { dz.innerHTML = m; }));
+        parties = toParties(await ocrText(ocrCanvas, (m) => { dz.innerHTML = m; }));
       } catch (_) {}
       dz.innerHTML = oldHtml;
-      for (const c of codes) await handleCode(c.rawValue, 'image', c.format, file.name, parties);
+      for (const c of scanned.results) await handleCode(c.rawValue, 'image', c.format, file.name, parties);
     } catch (e) {
       dz.innerHTML = oldHtml;
       showBanner('err', `<div style="font-size:26px">❗</div><div><b>识别失败</b>：${esc(e.message)}</div>`);
@@ -786,19 +806,44 @@
       img.src = url;
     });
   }
-  // 用 jsQR 在一幅图上反复识别多个二维码：每找到一个就涂白该区域，再找下一个
+  // 由 jsQR 返回的二维码四角坐标推算整页旋转角度（用于倒置检测）：
+  // 顶边（topLeft→topRight）本应水平向右（0°）；倒置时为 180°。
+  function qrRotationAngle(location) {
+    const tl = location && location.topLeftCorner;
+    const tr = location && location.topRightCorner;
+    if (!tl || !tr) return 0;
+    const ang = Math.atan2(tr.y - tl.y, tr.x - tl.x) * 180 / Math.PI;
+    return ((Math.round(ang / 90) * 90) % 360 + 360) % 360;
+  }
+  // 将画布旋转 90/180/270 度（0 度原样返回）。canvas 的 rotate 正值即顺时针。
+  function rotateCanvas(canvas, deg) {
+    deg = ((deg || 0) % 360 + 360) % 360;
+    if (deg === 0) return canvas;
+    const w = canvas.width, h = canvas.height;
+    const out = document.createElement('canvas');
+    out.width = (deg % 180) ? h : w;
+    out.height = (deg % 180) ? w : h;
+    const ctx = out.getContext('2d');
+    ctx.translate(out.width / 2, out.height / 2);
+    ctx.rotate(deg * Math.PI / 180);
+    ctx.drawImage(canvas, -w / 2, -h / 2);
+    return out;
+  }
+  // 用 jsQR 在一幅图上反复识别多个二维码：每找到一个就涂白该区域，再找下一个。
+  // 返回 { codes, rotation }，rotation 取自首个二维码（整页朝向）。
   function scanJsQRMulti(canvas) {
-    if (typeof jsQR === 'undefined') return [];
-    const codes = [];
+    const out = { codes: [], rotation: 0 };
+    if (typeof jsQR === 'undefined') return out;
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
     const w = canvas.width, h = canvas.height;
     const data = ctx.getImageData(0, 0, w, h);
-    let guard = 0;
+    let guard = 0, rotationSet = false;
     while (guard++ < 20) {
       let qr = null;
       try { qr = jsQR(data.data, w, h); } catch (_) { break; }
       if (!qr || !qr.data) break;
-      if (!codes.includes(qr.data)) codes.push(qr.data);
+      if (!out.codes.includes(qr.data)) out.codes.push(qr.data);
+      if (!rotationSet && qr.location) { out.rotation = qrRotationAngle(qr.location); rotationSet = true; }
       const loc = qr.location;
       if (!loc) break;
       const xs = [loc.topLeftCorner.x, loc.topRightCorner.x, loc.bottomRightCorner.x, loc.bottomLeftCorner.x];
@@ -815,11 +860,12 @@
         }
       }
     }
-    return codes;
+    return out;
   }
 
   // ==================== PDF 识别 ====================
   // 对一个已渲染好的 canvas 同时用 BarcodeDetector + 多码 jsQR 识别，去重后返回
+  // 返回 { results, rotation }，rotation 用于整页倒置时先纠正方向再 OCR
   async function scanCanvas(canvas) {
     const results = [];
     const det = getDetector();
@@ -832,10 +878,11 @@
         }
       } catch (_) {}
     }
-    for (const v of scanJsQRMulti(canvas)) {
+    const js = scanJsQRMulti(canvas);
+    for (const v of js.codes) {
       if (!results.some(r => r.rawValue === v)) results.push({ rawValue: v, format: 'qr_code' });
     }
-    return results;
+    return { results, rotation: js.rotation };
   }
 
   // 把 PDF 内嵌图片原始数据解码成 RGBA（kind: 1=1bit灰度, 2=RGB24, 3=RGBA32）
@@ -935,14 +982,17 @@
         const page = await pdf.getPage(i);
         // 先原始分辨率提取内嵌图片二维码（补漏扫，需在渲染前读取，避免 objs 被渲染消费）
         let codes = await scanPageImages(page);
-        // 再整页渲染，用 BarcodeDetector + jsQR 兜底；同时保留该 canvas 供 OCR 使用
+        // 再整页渲染，用 BarcodeDetector + jsQR 兜底；同时检测整页是否倒置（rotation）
         const canvas = await renderPage(page, 4);
-        for (const c of await scanCanvas(canvas)) {
+        const scanned = await scanCanvas(canvas);
+        for (const c of scanned.results) {
           if (!codes.some(x => x.rawValue === c.rawValue)) codes.push(c);
         }
         if (codes.length) {
+          // 倒置时先纠正方向，OCR 才能识别出购买方/销售方名称与税号
+          const ocrCanvas = rotateCanvas(canvas, -scanned.rotation);
           for (const c of codes) {
-            if (!found.some(x => x.rawValue === c.rawValue)) found.push({ ...c, canvas });
+            if (!found.some(x => x.rawValue === c.rawValue)) found.push({ ...c, canvas: ocrCanvas });
           }
         }
         page.cleanup();
