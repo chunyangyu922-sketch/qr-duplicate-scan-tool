@@ -6,6 +6,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { exec } = require('node:child_process');
 const { DatabaseSync } = require('node:sqlite');
+const crypto = require('node:crypto');
 
 const ROOT = __dirname;
 const PUBLIC_DIR = path.join(ROOT, 'public');
@@ -61,6 +62,22 @@ if (existingCols.includes('company') || existingCols.includes('tax_id')) {
   } catch (_) { /* 迁移失败不阻断启动 */ }
 }
 
+// ==================== 科大讯飞云端 OCR（可选增强，密钥仅存服务端） ====================
+// 配置文件 config.json（已加入 .gitignore，不会被提交到 Git）：
+// { "xfyun": { "appid": "...", "apikey": "...", "apisecret": "...",
+//              "host": "api.xf-yun.com", "path": "/v1/private/s824758f1", "serviceId": "s824758f1" } }
+let XF = null;
+try {
+  const cfgPath = path.join(ROOT, 'config.json');
+  if (fs.existsSync(cfgPath)) {
+    const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+    XF = (cfg && cfg.xfyun) ? cfg.xfyun : null;
+  }
+} catch (e) {
+  console.warn('读取 config.json 失败，云端 OCR 不可用：', e.message);
+}
+if (XF && (!XF.appid || !XF.apikey || !XF.apisecret)) XF = null;
+
 const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
@@ -84,12 +101,14 @@ function sendJson(res, status, obj) {
   res.end(JSON.stringify(obj));
 }
 
-function readBody(req) {
+function readBody(req, maxBytes = 1024 * 1024) {
   return new Promise((resolve, reject) => {
     let data = '';
+    let size = 0;
     req.on('data', (c) => {
+      size += c.length;
+      if (size > maxBytes) { req.destroy(); reject(new Error('请求体过大')); return; }
       data += c;
-      if (data.length > 1024 * 1024) req.destroy();
     });
     req.on('end', () => {
       try { resolve(data ? JSON.parse(data) : {}); } catch (e) { reject(e); }
@@ -108,6 +127,145 @@ function getStats() {
   return { total, scans };
 }
 
+// 生成科大讯飞 REST 鉴权 URL（HMAC-SHA256 签名，标准 Base64，POST 请求行）
+function xfBuildUrl() {
+  const date = new Date().toUTCString();                 // RFC1123 时间
+  const requestLine = `POST ${XF.path} HTTP/1.1`;
+  const origin = `host: ${XF.host}\ndate: ${date}\n${requestLine}`;
+  const signature = crypto.createHmac('sha256', XF.apisecret).update(origin).digest('base64');
+  const authOrigin = `api_key="${XF.apikey}", algorithm="hmac-sha256", headers="host date request-line", signature="${signature}"`;
+  const authorization = Buffer.from(authOrigin).toString('base64');
+  const qs = `authorization=${encodeURIComponent(authorization)}&date=${encodeURIComponent(date)}&host=${encodeURIComponent(XF.host)}`;
+  return `https://${XF.host}${XF.path}?${qs}`;
+}
+
+// 解析讯飞增值税发票识别返回的结构化 JSON，返回 { text, parties }
+// text：全部识别文本行（用于展示与兜底）；parties：购买方/销售方名称与税号。
+// 讯飞实际返回层级为 object_list → region_list → text_block_list → text_sent_list[].text，
+// 字段用 key/class 标识；扫描件（数电票）里购买方在左、销售方在右，按位置区分买卖方。
+function xfParseInvoice(obj) {
+  const entries = [];   // { key, text, x, y }
+  const seen = new Set();
+  // 1) 收集所有文本（含坐标）：主格式 text_sent_list[].text
+  (function collect(node) {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) { node.forEach(collect); return; }
+    if (Array.isArray(node.text_sent_list)) {
+      const key = node.key || node.class || '';
+      for (const s of node.text_sent_list) {
+        const text = String((s && typeof s === 'object' ? (s.text || s.content || '') : (s || ''))).trim();
+        if (!text) continue;
+        const pos = (s && s.position && s.position.tl_point) || (node.position && node.position.tl_point) || null;
+        const x = pos ? pos.x : null;
+        const y = pos ? pos.y : null;
+        if (!seen.has(text)) { seen.add(text); entries.push({ key: String(key), text, x, y }); }
+      }
+    }
+    for (const k in node) collect(node[k]);
+  })(obj);
+  // 2) 老格式兜底：{type/name/label, content/value} 字段对
+  if (!entries.length) {
+    const labelKeys = ['type', 'name', 'label', 'key', 'field', 'field_name', 'fieldName', 'title'];
+    const contentKeys = ['content', 'value', 'text', 'result', 'field_value', 'fieldValue'];
+    (function walk(node) {
+      if (!node || typeof node !== 'object') return;
+      if (Array.isArray(node)) { node.forEach(walk); return; }
+      let label = '';
+      for (const k of labelKeys) { const v = node[k]; if (typeof v === 'string' && v.trim()) { label = v.trim(); break; } }
+      let content = null;
+      for (const k of contentKeys) { if (node[k] != null && String(node[k]).trim()) { content = String(node[k]).trim(); break; } }
+      if (label && content) {
+        if (!seen.has(content)) { seen.add(content); entries.push({ key: label, text: content, x: null, y: null }); }
+        return;
+      }
+      for (const k in node) walk(node[k]);
+    })(obj);
+  }
+
+  // 3) 提取税号（统一社会信用代码 18 位 / 纳税人识别号 15-20 位）与公司/机构名称
+  const nameRe = /[一-龥A-Za-z0-9（）()·]+(?:有限责任公司|股份有限公司|有限公司|医院|学校|大学|学院|中心|店|厂|集团|公司|事务所|合作社|银行|支行|分行|车站|宾馆|酒店|餐厅|餐饮)/;
+  const taxes = [];   // { code, x, y }
+  const names = [];   // { name, x, y }
+  for (const e of entries) {
+    for (const c of (e.text.match(/[0-9][0-9A-Za-z]{14,19}/g) || [])) {
+      const code = c.toUpperCase();
+      // 仅保留真正的统一社会信用代码（18 位含字母）或老版纳税人识别号（15 位纯数字），
+      // 排除发票号码、银行账号等纯数字长串
+      const isTax = (code.length === 18 && /[A-Z]/.test(code)) || (code.length === 15 && /^\d{15}$/.test(code));
+      if (isTax && !taxes.some(t => t.code === code)) taxes.push({ code, x: e.x, y: e.y });
+    }
+    // 去掉常见标签前缀后，取以公司/机构后缀结尾的最长片段
+    const cleaned = e.text.replace(/^(?:名称|名\s*称|称|收款单位|开票方|购方名称|销方名称|购买方|销售方)\s*[:：]?\s*/, '');
+    const m = cleaned.match(nameRe);
+    if (m) {
+      const name = m[0].replace(/^[:：·、。*\-\s]+/, '').trim();
+      if (name && name.length >= 4 && !names.some(n => n.name === name)) names.push({ name, x: e.x, y: e.y });
+    }
+  }
+
+  // 4) 按位置分配：左/上 = 购买方，右/下 = 销售方
+  const maxX = entries.reduce((m, e) => (e.x != null && e.x > m ? e.x : m), 0);
+  const maxY = entries.reduce((m, e) => (e.y != null && e.y > m ? e.y : m), 0);
+  const pick = (list) => {
+    const arr = list;
+    if (arr.length === 0) return { buyer: null, seller: null };
+    if (arr.length === 1) {
+      const it = arr[0];
+      const right = it.x != null && maxX > 0 && it.x >= maxX * 0.5;
+      const bottom = it.y != null && maxY > 0 && it.y >= maxY * 0.5;
+      return right || bottom ? { buyer: null, seller: it } : { buyer: it, seller: null };
+    }
+    const xs = arr.filter(i => i.x != null).map(i => i.x);
+    const ys = arr.filter(i => i.y != null).map(i => i.y);
+    const xSpread = xs.length >= 2 ? Math.max(...xs) - Math.min(...xs) : 0;
+    const ySpread = ys.length >= 2 ? Math.max(...ys) - Math.min(...ys) : 0;
+    let sorted;
+    if (ySpread > xSpread && ySpread > 150) sorted = [...arr].sort((a, b) => (a.y || 0) - (b.y || 0)); // 上下：上=购买方
+    else sorted = [...arr].sort((a, b) => (a.x || 0) - (b.x || 0));                                  // 左右：左=购买方
+    return { buyer: sorted[0], seller: sorted[sorted.length - 1] };
+  };
+  const taxPair = pick(taxes);
+  const namePair = pick(names);
+
+  const parties = {
+    buyerName: namePair.buyer ? namePair.buyer.name : '',
+    buyerTaxId: taxPair.buyer ? taxPair.buyer.code : '',
+    sellerName: namePair.seller ? namePair.seller.name : '',
+    sellerTaxId: taxPair.seller ? taxPair.seller.code : '',
+  };
+
+  return { text: entries.map(e => e.text).join('\n'), parties };
+}
+
+// 调用科大讯飞增值税发票识别，成功返回 { text, parties }，失败 reject
+async function xfOcr(imageB64, encoding) {
+  const url = xfBuildUrl();
+  const sid = XF.serviceId || 's824758f1';
+  const templateList = XF.templateList || 'vat_invoice';
+  const body = {
+    header: { app_id: XF.appid, status: 3 },
+    parameter: { [sid]: { template_list: templateList, result: { encoding: 'utf8', compress: 'raw', format: 'json' } } },
+    payload: { [sid + '_data_1']: { encoding: encoding || 'jpg', status: 3, image: imageB64 } },
+  };
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error('讯飞接口返回 HTTP ' + res.status);
+  let msg;
+  try { msg = await res.json(); } catch (_) { throw new Error('讯飞返回格式异常'); }
+  const code = msg.header && msg.header.code;
+  if (code !== 0) throw new Error('讯飞返回错误(code=' + code + ')：' + ((msg.header && msg.header.message) || ''));
+  const textB64 = msg.payload && msg.payload.result && msg.payload.result.text;
+  if (!textB64) return { text: '', parties: null };
+  let raw;
+  try { raw = Buffer.from(textB64, 'base64').toString('utf8').replace(/\0+/g, '').trim(); } catch (_) { return { text: '', parties: null }; }
+  let obj;
+  try { obj = JSON.parse(raw); } catch (_) { return { text: raw, parties: null }; }
+  return xfParseInvoice(obj);
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
   const pathname = decodeURIComponent(url.pathname);
@@ -119,6 +277,20 @@ const server = http.createServer(async (req, res) => {
     }
     if (pathname === '/api/stats' && req.method === 'GET') {
       return sendJson(res, 200, getStats());
+    }
+
+    if (pathname === '/api/ocr' && req.method === 'POST') {
+      if (!XF) return sendJson(res, 503, { error: '未配置科大讯飞 OCR（缺少 config.json 或配置不完整）' });
+      const body = await readBody(req, 8 * 1024 * 1024);
+      const image = String(body.image ?? '').replace(/\s+/g, '');
+      if (!image) return sendJson(res, 400, { error: '缺少图片数据' });
+      const encoding = String(body.encoding ?? 'jpg');
+      try {
+        const r = await xfOcr(image, encoding);
+        return sendJson(res, 200, { text: r.text || '', parties: r.parties || null });
+      } catch (e) {
+        return sendJson(res, 502, { error: String((e && e.message) || e) });
+      }
     }
 
     if (pathname === '/api/scan' && req.method === 'POST') {

@@ -335,6 +335,21 @@
       sellerTaxId: String(o.sellerTaxId || '').trim().toUpperCase(),
     };
   }
+  // 合并两份识别结果，缺失字段用另一份补齐（base 优先）
+  function mergeParties(base, add) {
+    const b = normalizeParties(base);
+    const a = normalizeParties(add);
+    return normalizeParties({
+      buyerName: b.buyerName || a.buyerName,
+      buyerTaxId: b.buyerTaxId || a.buyerTaxId,
+      sellerName: b.sellerName || a.sellerName,
+      sellerTaxId: b.sellerTaxId || a.sellerTaxId,
+    });
+  }
+  // 购买方/销售方 名称与税号是否已全部识别到
+  function isComplete(p) {
+    return !!(p && p.buyerName && p.buyerTaxId && p.sellerName && p.sellerTaxId);
+  }
 
   // ==================== OCR 识别（Tesseract.js 离线，识别购买方/销售方） ====================
   let ocrWorker = null;   // Promise<TesseractWorker> 或 null
@@ -363,22 +378,84 @@
     return ocrWorker;
   }
 
-  // 对已渲染的 canvas 执行 OCR，返回全文文本（失败返回 null）
+  // 调用科大讯飞云端增值税发票识别（经本地服务端转发，密钥不会暴露给浏览器）
+  // 成功返回 { text, parties }，失败返回 null
+  async function cloudOcr(canvas, statusCb) {
+    try {
+      if (statusCb) statusCb('☁️ 正在使用科大讯飞云端识别…');
+      let src = canvas;
+      let dataUrl = src.toDataURL('image/jpeg', 0.9);
+      // 科大讯飞要求图片 base64 ≤ 4MB，超出则逐步缩小
+      let guard = 0;
+      while (dataUrl.length > 3.5 * 1024 * 1024 && guard++ < 3) {
+        const scale = Math.sqrt((3.0 * 1024 * 1024) / dataUrl.length);
+        const c = document.createElement('canvas');
+        c.width = Math.max(1, Math.round(src.width * scale));
+        c.height = Math.max(1, Math.round(src.height * scale));
+        c.getContext('2d').drawImage(src, 0, 0, c.width, c.height);
+        src = c;
+        dataUrl = src.toDataURL('image/jpeg', 0.9);
+      }
+      const image = dataUrl.slice(dataUrl.indexOf(',') + 1);
+      const res = await fetch('/api/ocr', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ image, encoding: 'jpg' }),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(json.error || '云端识别失败');
+      return { text: json.text || '', parties: json.parties || null };
+    } catch (e) {
+      console.warn('科大讯飞云端识别失败，回退本地识别：', e && e.message);
+      return null;
+    }
+  }
+
+  // 把 OCR 结果 { text, parties } 转成 { buyerName, buyerTaxId, sellerName, sellerTaxId }
+  function toParties(r) {
+    if (!r || !r.parties) return null;
+    const p = normalizeParties(r.parties);
+    return (p.buyerName || p.buyerTaxId || p.sellerName || p.sellerTaxId) ? p : null;
+  }
+
+  // 对已渲染的 canvas 识别购买方/销售方信息，返回 { text, parties }（失败返回 null）
   // 用队列串行执行，避免多个文件/页面并发调用共享 worker 导致识别失败或漏识别
   let ocrChain = Promise.resolve();
+
+  // 本地 Tesseract 识别全文，失败返回 null
+  async function tesseractOcr(canvas) {
+    try {
+      const worker = await getOcrWorker();
+      if (!worker) return null;
+      const r = await worker.recognize(canvas, {}, { blocks: false, text: true, hocr: false, tsv: false });
+      return (r && r.data && r.data.text) ? r.data.text : '';
+    } catch (e) {
+      console.error('OCR 识别失败', e);
+      return null;
+    }
+  }
+
   function ocrText(canvas, statusCb) {
     const prev = ocrStatusCb;
     ocrStatusCb = statusCb || null;
     const task = ocrChain.then(async () => {
-      try {
-        const worker = await getOcrWorker();
-        if (!worker) return null;
-        const r = await worker.recognize(canvas, {}, { blocks: false, text: true, hocr: false, tsv: false });
-        return (r && r.data && r.data.text) ? r.data.text : null;
-      } catch (e) {
-        console.error('OCR 识别失败', e);
-        return null;
+      // 优先科大讯飞云端识别（更准），无结果/失败则回退本地 Tesseract；两端结果合并补齐缺失字段
+      const cloud = await cloudOcr(canvas, statusCb);
+      let cloudParties = null, cloudText = '';
+      if (cloud) { cloudText = cloud.text || ''; cloudParties = cloud.parties ? normalizeParties(cloud.parties) : null; }
+      if (cloudText || cloudParties) {
+        let merged = normalizeParties(cloudParties);
+        if (!isComplete(merged)) {
+          // 云端漏检个别字段（如某些页缺销售方税号）：用本地 Tesseract 补齐
+          const local = await tesseractOcr(canvas);
+          if (local) merged = mergeParties(merged, parseOcrText(local));
+        }
+        return { text: cloudText, parties: merged };
       }
+      // 云端失败：本地 Tesseract
+      const local = await tesseractOcr(canvas);
+      if (!local) return null;
+      return { text: local, parties: parseOcrText(local) };
     });
     ocrChain = task.then(() => {}, () => {});
     return task.finally(() => { ocrStatusCb = prev; });
@@ -691,8 +768,7 @@
       // OCR 识别购买方 / 销售方 名称与税号（尽力而为）
       let parties = null;
       try {
-        const text = await ocrText(canvas, (m) => { dz.innerHTML = m; });
-        if (text) parties = parseOcrText(text);
+        parties = toParties(await ocrText(canvas, (m) => { dz.innerHTML = m; }));
       } catch (_) {}
       dz.innerHTML = oldHtml;
       for (const c of codes) await handleCode(c.rawValue, 'image', c.format, file.name, parties);
@@ -762,6 +838,17 @@
     return results;
   }
 
+  // 按指定比例渲染页面为 canvas（用于二维码识别与 OCR）
+  async function renderPage(page, scale) {
+    const viewport = page.getViewport({ scale });
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(viewport.width));
+    canvas.height = Math.max(1, Math.round(viewport.height));
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    await page.render({ canvasContext: ctx, viewport }).promise;
+    return canvas;
+  }
+
   async function scanPdfFile(file) {
     const dz = getDropzone();
     const oldHtml = dz.innerHTML;
@@ -776,13 +863,8 @@
       for (let i = 1; i <= pageCount; i++) {
         setStatus('⏳ 正在识别第 ' + i + ' / ' + pageCount + ' 页…');
         const page = await pdf.getPage(i);
-        const viewport = page.getViewport({ scale: 4 });
-        const canvas = document.createElement('canvas');
-        canvas.width = viewport.width;
-        canvas.height = viewport.height;
-        const ctx = canvas.getContext('2d', { willReadFrequently: true });
-        await page.render({ canvasContext: ctx, viewport }).promise;
-        const codes = await scanCanvas(canvas);
+        const canvas = await renderPage(page, 4);
+        const codes = await scanCanvas(canvas);        // BarcodeDetector + jsQR
         if (codes.length) {
           for (const c of codes) {
             if (!found.some(x => x.rawValue === c.rawValue)) found.push({ ...c, canvas });
@@ -804,13 +886,8 @@
         page1Parties = null;
         try {
           const page = await pdf.getPage(1);
-          const viewport = page.getViewport({ scale: 4 });
-          const canvas = document.createElement('canvas');
-          canvas.width = viewport.width; canvas.height = viewport.height;
-          const ctx = canvas.getContext('2d', { willReadFrequently: true });
-          await page.render({ canvasContext: ctx, viewport }).promise;
-          const text = await ocrText(canvas, (m) => { dz.innerHTML = m; });
-          if (text) page1Parties = parseOcrText(text);
+          const canvas = await renderPage(page, 4);
+          page1Parties = toParties(await ocrText(canvas, (m) => { dz.innerHTML = m; }));
           page.cleanup();
         } catch (_) {}
         return page1Parties;
@@ -820,8 +897,7 @@
         if (parties === undefined) {
           parties = null;
           try {
-            const text = await ocrText(c.canvas, (m) => { dz.innerHTML = m; });
-            if (text) parties = parseOcrText(text);
+            parties = toParties(await ocrText(c.canvas, (m) => { dz.innerHTML = m; }));
           } catch (_) {}
           pageParties.set(c.canvas, parties);
         }
