@@ -1523,12 +1523,13 @@
       return new Uint8ClampedArray(ctx.getImageData(0, 0, w, h).data);
     } catch (_) { return null; }
   }
-  function scaleRgba(rgba, w, h, nw, nh) {
+  function scaleRgba(rgba, w, h, nw, nh, ox, oy) {
     const out = new Uint8ClampedArray(nw * nh * 4);
+    const px = ox || 0, py = oy || 0;   // 抽样相位偏移，见 scanPageImages 里的说明
     for (let y = 0; y < nh; y++) {
-      const sy = Math.min(h - 1, (y * h / nh) | 0);
+      const sy = Math.min(h - 1, ((y * h / nh) + py) | 0);
       for (let x = 0; x < nw; x++) {
-        const sx = Math.min(w - 1, (x * w / nw) | 0);
+        const sx = Math.min(w - 1, ((x * w / nw) + px) | 0);
         const a = (sy * w + sx) * 4, b = (y * nw + x) * 4;
         out[b] = rgba[a]; out[b + 1] = rgba[a + 1]; out[b + 2] = rgba[a + 2]; out[b + 3] = 255;
       }
@@ -1559,7 +1560,19 @@
       };
       let hit = attempt(new Uint8ClampedArray(rgba), w, h);                                  // 原生分辨率
       if (!hit.codes.length && w * 2 <= 6000 && h * 2 <= 6000) hit = attempt(scaleRgba(rgba, w, h, w * 2, h * 2), w * 2, h * 2); // 2x 放大
-      if (!hit.codes.length && w >= 42 && h >= 42) hit = attempt(scaleRgba(rgba, w, h, w >> 1, h >> 1), w >> 1, h >> 1);          // 0.5x 降采样
+      // 0.5x 降采样（最近邻抽样）。成败取决于抽样网格与二维码模块网格的相对相位 —— 扫描件里二维码只有
+      // 3~4px/模块，抽样每错开一格，落到的就不是同一批模块，jsQR 于是从一个都解不出变成能解出。而同一份
+      // PDF 里每张发票二维码的位置、尺寸都不同，需要的相位也不同（实测 170 张内嵌图片里有 3 张只有靠
+      // 后几种相位才出得来，比如金额 337.74 那张滴滴发票：1x、2x、0.5x(w>>1) 全失败，四舍五入就出来了）。
+      // 这里把目标边长取整方式与相位偏移的四种组合都试一遍，覆盖行、列两轴各自的两种抽样相位；命中即停。
+      if (!hit.codes.length && w >= 42 && h >= 42) {
+        const fw = w >> 1, fh = h >> 1;                                   // 向下取整（原有档位）
+        const rw = Math.round(w / 2), rh = Math.round(h / 2);             // 四舍五入：边长奇数时换了另一组行列
+        hit = attempt(scaleRgba(rgba, w, h, fw, fh), fw, fh);
+        if (!hit.codes.length && (rw !== fw || rh !== fh)) hit = attempt(scaleRgba(rgba, w, h, rw, rh), rw, rh);
+        if (!hit.codes.length) hit = attempt(scaleRgba(rgba, w, h, rw, rh, 1, 1), rw, rh);   // 行、列各错开一格
+        if (!hit.codes.length) hit = attempt(scaleRgba(rgba, w, h, rw, rh, 1, 0), rw, rh);   // 只把列错开一格
+      }
       const cv = canvasFromRgba(rgba, w, h);
       const codes = hit.codes.slice();
       // 条形码 / 部分二维码 jsQR 认不出，用系统 BarcodeDetector 在图片本身上再兜一层
